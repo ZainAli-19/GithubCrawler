@@ -1,12 +1,37 @@
 import os
 import time
 import logging
+import psycopg2
 from crawler.graphql_client import GitHubClient
 
 CHECKPOINT_FILE = "data/checkpoint.txt"
 TOTAL_TARGET = 100_000  # Target number of repositories
 
 
+# ==========================
+# PostgreSQL Connection
+# ==========================
+def get_connection(retries=10, delay=5):
+    """Establish and return a PostgreSQL connection with retries."""
+    for attempt in range(1, retries + 1):
+        try:
+            conn = psycopg2.connect(
+                host=os.getenv("POSTGRES_HOST", "localhost"),
+                database=os.getenv("POSTGRES_DB", "postgres"),
+                user=os.getenv("POSTGRES_USER", "postgres"),
+                password=os.getenv("POSTGRES_PASSWORD", "postgres"),
+            )
+            logging.info("✅ Connected to PostgreSQL.")
+            return conn
+        except psycopg2.OperationalError as e:
+            logging.warning(f"⚠️ Database not ready (attempt {attempt}/{retries}): {e}")
+            time.sleep(delay)
+    raise RuntimeError("❌ Could not connect to PostgreSQL after multiple attempts.")
+
+
+# ==========================
+# Checkpoint Handling
+# ==========================
 def save_checkpoint(cursor_value, total_repos):
     os.makedirs("data", exist_ok=True)
     with open(CHECKPOINT_FILE, "w") as f:
@@ -24,9 +49,43 @@ def load_checkpoint():
     return None, 0
 
 
+# ==========================
+# Repository Insertion
+# ==========================
+def insert_repositories(conn, edges):
+    """Insert a batch of repositories into the database."""
+    with conn.cursor() as cur:
+        for edge in edges:
+            repo = edge["node"]
+            cur.execute(
+                """
+                INSERT INTO repositories (id, name, full_name, stars, language, created_at, updated_at, owner)
+                VALUES (md5(%s::text), %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (id) DO UPDATE
+                SET stars = EXCLUDED.stars,
+                    updated_at = EXCLUDED.updated_at;
+                """,
+                (
+                    repo["url"],  # use URL to derive a unique id
+                    repo["name"],
+                    f"{repo['owner']['login']}/{repo['name']}",
+                    repo["stargazerCount"],
+                    repo["primaryLanguage"]["name"] if repo["primaryLanguage"] else None,
+                    repo["createdAt"],
+                    repo["updatedAt"],
+                    repo["owner"]["login"],
+                ),
+            )
+    conn.commit()
+
+
+# ==========================
+# Main Crawler Logic
+# ==========================
 def crawl_repositories():
     logging.basicConfig(
-        format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO
+        format="%(asctime)s | %(levelname)s | %(message)s",
+        level=logging.INFO
     )
 
     token = os.getenv("GITHUB_TOKEN")
