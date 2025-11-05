@@ -77,6 +77,7 @@ jobs:
           POSTGRES_PASSWORD: postgres
           POSTGRES_DB: postgres
           GITHUB_TOKEN: ${{ github.token }}
+          PYTHONPATH: src   
         run: |
           echo "🚀 Starting or resuming crawl..."
           python -m src.crawler.crawler
