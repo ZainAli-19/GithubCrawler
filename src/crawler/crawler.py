@@ -1,9 +1,8 @@
 import os
-import requests
 import psycopg2
 import time
 import logging
-from datetime import datetime
+from crawler.graphql_client import GitHubClient
 
 # ===============================
 # Logging Configuration
@@ -14,9 +13,8 @@ logging.basicConfig(
 )
 
 # ===============================
-# GitHub Crawler Configuration
+# Environment Configuration
 # ===============================
-GITHUB_API_URL = "https://api.github.com/graphql"
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 
 POSTGRES_HOST = os.getenv("POSTGRES_HOST", "localhost")
@@ -25,7 +23,7 @@ POSTGRES_USER = os.getenv("POSTGRES_USER", "postgres")
 POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD", "postgres")
 
 # ===============================
-# GraphQL Query (Fixed)
+# GraphQL Query
 # ===============================
 query_template = """
 query($cursor: String) {
@@ -76,34 +74,11 @@ def insert_repo_batch(cursor, repos):
         )
 
 # ===============================
-# Helper: GitHub API with retry & rate-limit
-# ===============================
-def github_post(query, variables, headers, max_retries=5):
-    for attempt in range(max_retries):
-        response = requests.post(GITHUB_API_URL, json={"query": query, "variables": variables}, headers=headers)
-        if response.status_code == 200:
-            data = response.json()
-            if "errors" not in data:
-                return data
-            logging.warning(f"GraphQL errors: {data['errors']}")
-        elif response.status_code == 502:
-            logging.warning("Received 502 Bad Gateway, retrying...")
-        elif response.status_code == 403 and "X-RateLimit-Reset" in response.headers:
-            reset_time = int(response.headers["X-RateLimit-Reset"])
-            wait_time = max(0, reset_time - int(time.time())) + 5
-            logging.warning(f"Rate limit hit. Waiting {wait_time} seconds...")
-            time.sleep(wait_time)
-            continue
-
-        time.sleep(2 ** attempt)  # exponential backoff
-    logging.error(f"Failed after {max_retries} retries.")
-    return None
-
-# ===============================
 # Main Crawler Logic
 # ===============================
 def crawl():
-    headers = {"Authorization": f"Bearer {GITHUB_TOKEN}"}
+    client = GitHubClient(GITHUB_TOKEN)
+
     connection = psycopg2.connect(
         host=POSTGRES_HOST,
         database=POSTGRES_DB,
@@ -118,9 +93,9 @@ def crawl():
     logging.info("🚀 Starting crawl of GitHub repositories...")
 
     while total_repos < 100_000:
-        data = github_post(query_template, {"cursor": cursor_value}, headers)
-        if not data:
-            logging.warning("No data received. Retrying...")
+        data = client.run_query(query_template, {"cursor": cursor_value})
+        if not data or "data" not in data or "search" not in data["data"]:
+            logging.warning("⚠️ Empty or invalid response, retrying...")
             time.sleep(5)
             continue
 
@@ -134,10 +109,11 @@ def crawl():
         logging.info(f"✅ Inserted {total_repos} repositories so far...")
 
         if not page_info["hasNextPage"]:
+            logging.info("🎉 No more pages available — crawl complete.")
             break
 
         cursor_value = page_info["endCursor"]
-        time.sleep(1.5)  # Gentle pause for rate limits
+        time.sleep(1.5)
 
     cursor.close()
     connection.close()
