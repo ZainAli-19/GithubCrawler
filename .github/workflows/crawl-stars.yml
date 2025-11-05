@@ -7,21 +7,6 @@ jobs:
   crawl:
     runs-on: ubuntu-latest
 
-    services:
-      postgres:
-        image: postgres:15
-        env:
-          POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: postgres
-          POSTGRES_DB: postgres
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U postgres"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 10
-
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -34,40 +19,40 @@ jobs:
       - name: Install dependencies
         run: pip install -r src/requirements.txt
 
-      # 🕐 Ensure PostgreSQL is ready before running SQL
-      - name: Wait for Postgres service to be ready
-        env:
-          PGPASSWORD: postgres
+      # 🟢 Start PostgreSQL service built into the runner
+      - name: Start PostgreSQL service
         run: |
-          echo "⏳ Waiting for Postgres service to be ready..."
-          for i in {1..30}; do
-            if pg_isready -h postgres -p 5432 -U postgres; then
-              echo "✅ Postgres is ready!"
+          echo "🚀 Starting built-in PostgreSQL service..."
+          sudo service postgresql start
+          sudo -u postgres psql -c "ALTER USER postgres PASSWORD 'postgres';"
+          sudo -u postgres createdb postgres
+          echo "✅ PostgreSQL started successfully."
+
+      # 🕒 Wait for PostgreSQL to be ready
+      - name: Wait for PostgreSQL to be available
+        run: |
+          echo "⏳ Waiting for PostgreSQL to accept connections..."
+          for i in {1..15}; do
+            if pg_isready -h localhost -p 5432 -U postgres; then
+              echo "✅ PostgreSQL is ready!"
               break
             else
-              echo "Postgres not ready yet... waiting 5s"
-              sleep 5
+              echo "PostgreSQL not ready yet... waiting 3s"
+              sleep 3
             fi
           done
-          # Fallback: start local Postgres if container failed
-          if ! pg_isready -h postgres -p 5432 -U postgres; then
-            echo "⚠️ Container did not start, starting system Postgres as fallback..."
-            sudo service postgresql start
-            until pg_isready -h localhost -p 5432 -U postgres; do sleep 3; done
-          fi
 
       - name: Setup database schema
         env:
           PGPASSWORD: postgres
         run: |
           echo "📦 Creating tables..."
-          psql -h postgres -U postgres -d postgres -f src/db/migrations/001_create_tables.sql || \
           psql -h localhost -U postgres -d postgres -f src/db/migrations/001_create_tables.sql
           echo "✅ Tables created successfully."
 
       - name: Run crawler
         env:
-          POSTGRES_HOST: postgres
+          POSTGRES_HOST: localhost
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
           POSTGRES_DB: postgres
@@ -82,7 +67,6 @@ jobs:
           PGPASSWORD: postgres
         run: |
           echo "📤 Exporting database to CSV..."
-          psql -h postgres -U postgres -d postgres -c "\copy (SELECT * FROM repositories) TO 'repos.csv' CSV HEADER" || \
           psql -h localhost -U postgres -d postgres -c "\copy (SELECT * FROM repositories) TO 'repos.csv' CSV HEADER"
           echo "✅ Export complete."
 
