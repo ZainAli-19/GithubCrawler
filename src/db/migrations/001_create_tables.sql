@@ -8,3 +8,10 @@ CREATE TABLE IF NOT EXISTS repositories (
     updated_at TIMESTAMP,
     owner TEXT
 );
+
+CREATE TABLE IF NOT EXISTS crawl_state (
+    id SERIAL PRIMARY KEY,
+    last_cursor TEXT,
+    total_repos INTEGER DEFAULT 0,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
