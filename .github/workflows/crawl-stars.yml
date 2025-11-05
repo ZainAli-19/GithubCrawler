@@ -34,10 +34,24 @@ jobs:
       - name: Install dependencies
         run: pip install -r src/requirements.txt
 
+      # ✅ Added a "wait for Postgres" check before running the schema
       - name: Setup database schema
-        run: psql -h localhost -U postgres -d postgres -f src/db/migrations/001_create_tables.sql
         env:
           PGPASSWORD: postgres
+        run: |
+          echo "⏳ Waiting for Postgres to be ready..."
+          for i in {1..15}; do
+            if pg_isready -h localhost -p 5432 -U postgres; then
+              echo "✅ Postgres is ready!"
+              break
+            else
+              echo "Postgres not ready yet... waiting 3s"
+              sleep 3
+            fi
+          done
+          echo "📦 Creating tables..."
+          psql -h localhost -U postgres -d postgres -f src/db/migrations/001_create_tables.sql
+          echo "✅ Tables created successfully."
 
       - name: Run crawler
         env:
@@ -46,13 +60,18 @@ jobs:
           POSTGRES_PASSWORD: postgres
           POSTGRES_DB: postgres
           GITHUB_TOKEN: ${{ github.token }}
-        run: python src/app.py
+        run: |
+          echo "🚀 Starting GitHub crawler..."
+          python src/app.py
+          echo "✅ Crawler finished."
 
       - name: Export database to CSV
-        run: |
-          psql -h localhost -U postgres -d postgres -c "\copy (SELECT * FROM repositories) TO 'repos.csv' CSV HEADER"
         env:
           PGPASSWORD: postgres
+        run: |
+          echo "📤 Exporting database to CSV..."
+          psql -h localhost -U postgres -d postgres -c "\copy (SELECT * FROM repositories) TO 'repos.csv' CSV HEADER"
+          echo "✅ Export complete."
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
