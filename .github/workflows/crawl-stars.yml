@@ -15,7 +15,7 @@ jobs:
           POSTGRES_PASSWORD: postgres
           POSTGRES_DB: postgres
         ports:
-          - 5432
+          - 5432:5432
         options: >-
           --health-cmd "pg_isready -U postgres"
           --health-interval 10s
@@ -34,7 +34,7 @@ jobs:
       - name: Install dependencies
         run: pip install -r src/requirements.txt
 
-      # ✅ Wait for Postgres and connect using service hostname "postgres"
+      # ✅ Wait for Postgres (host = postgres)
       - name: Setup database schema
         env:
           PGPASSWORD: postgres
@@ -55,7 +55,7 @@ jobs:
 
       - name: Run crawler
         env:
-          POSTGRES_HOST: postgres   # ✅ changed from localhost
+          POSTGRES_HOST: postgres   # <-- ✅ correct host
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
           POSTGRES_DB: postgres
