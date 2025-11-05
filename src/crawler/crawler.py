@@ -2,7 +2,6 @@ import os
 import time
 import logging
 from crawler.graphql_client import GitHubClient
-from db.connection import get_connection
 from db.insertions import insert_repositories
 
 CHECKPOINT_FILE = "data/checkpoint.txt"
