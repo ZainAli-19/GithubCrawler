@@ -9,9 +9,10 @@ CREATE TABLE IF NOT EXISTS repositories (
     owner TEXT
 );
 
-CREATE TABLE IF NOT EXISTS crawl_state (
+-- ✅ Store progress state for resumable crawls
+CREATE TABLE IF NOT EXISTS crawl_checkpoint (
     id SERIAL PRIMARY KEY,
-    last_cursor TEXT,
+    cursor_value TEXT,
     total_repos INTEGER DEFAULT 0,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    updated_at TIMESTAMP DEFAULT NOW()
 );
