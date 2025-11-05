@@ -34,14 +34,14 @@ jobs:
       - name: Install dependencies
         run: pip install -r src/requirements.txt
 
-      # 🕒 Wait until the PostgreSQL service is ready
+      # 🕒 Wait until PostgreSQL is ready
       - name: Wait for PostgreSQL to be ready
         env:
           PGPASSWORD: postgres
         run: |
           echo "⏳ Waiting for PostgreSQL to be ready..."
           for i in {1..15}; do
-            if pg_isready -h postgres -p 5432 -U postgres; then
+            if pg_isready -h 127.0.0.1 -p 5432 -U postgres; then
               echo "✅ PostgreSQL is ready!"
               break
             else
@@ -50,38 +50,38 @@ jobs:
             fi
           done
 
-      # 🧱 Create database schema
+      # 🧱 Create schema
       - name: Setup database schema
         env:
           PGPASSWORD: postgres
         run: |
           echo "📦 Creating tables in PostgreSQL..."
-          psql -h postgres -U postgres -d postgres -f src/db/migrations/001_create_tables.sql
+          psql -h 127.0.0.1 -U postgres -d postgres -f src/db/migrations/001_create_tables.sql
           echo "✅ Tables created successfully."
 
-      # 🚀 Run crawler script
+      # 🚀 Run crawler
       - name: Run crawler
         env:
-          POSTGRES_HOST: postgres        # ✅ Correct host
+          POSTGRES_HOST: 127.0.0.1
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
           POSTGRES_DB: postgres
           GITHUB_TOKEN: ${{ github.token }}
         run: |
-          echo "🚀 Starting GitHub crawler..."
+          echo "🚀 Running crawler..."
           python src/app.py
-          echo "✅ Crawler finished successfully."
+          echo "✅ Crawler completed."
 
-      # 📤 Export database to CSV
+      # 📤 Export data to CSV
       - name: Export database to CSV
         env:
           PGPASSWORD: postgres
         run: |
-          echo "📤 Exporting database contents to repos.csv..."
-          psql -h postgres -U postgres -d postgres -c "\copy (SELECT * FROM repositories) TO 'repos.csv' CSV HEADER"
-          echo "✅ Export complete."
+          echo "📤 Exporting database to repos.csv..."
+          psql -h 127.0.0.1 -U postgres -d postgres -c "\copy (SELECT * FROM repositories) TO 'repos.csv' CSV HEADER"
+          echo "✅ Export done."
 
-      # 💾 Upload artifact to workflow output
+      # 💾 Upload artifact
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
