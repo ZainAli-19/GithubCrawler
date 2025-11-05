@@ -1,14 +1,14 @@
 name: Crawl Stars
 
 on:
-  workflow_dispatch:   # Manual trigger
+  workflow_dispatch:    # Manual trigger
   schedule:
-    - cron: "0 0 * * *"   # ⏰ Run daily at midnight UTC
+    - cron: "0 0 * * *"  # Run daily at midnight UTC
 
 jobs:
   crawl:
     runs-on: ubuntu-latest
-    timeout-minutes: 360   # allow long crawl (up to 6 hours)
+    timeout-minutes: 360   # allow up to 6 hours
 
     services:
       postgres:
@@ -24,13 +24,15 @@ jobs:
           --health-interval 10s
           --health-timeout 5s
           --health-retries 10
+        volumes:
+          - postgres-data:/var/lib/postgresql/data  # Persistent DB storage between runs
 
     steps:
       # 1️⃣ Checkout repository
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          persist-credentials: true  # Required for committing back to repo
+          persist-credentials: true
 
       # 2️⃣ Set up Python
       - name: Set up Python
@@ -58,17 +60,17 @@ jobs:
             fi
           done
 
-      # 5️⃣ Setup database schema
-      - name: Setup database schema
+      # 5️⃣ Setup schema (only if not exists)
+      - name: Initialize database schema
         env:
           PGPASSWORD: postgres
         run: |
-          echo "📦 Creating tables in PostgreSQL..."
+          echo "📦 Ensuring tables exist..."
           psql -h 127.0.0.1 -U postgres -d postgres -f src/db/migrations/001_create_tables.sql
-          echo "✅ Tables created successfully."
+          echo "✅ Schema ready."
 
-      # 6️⃣ Run crawler (100,000 repos)
-      - name: Run crawler
+      # 6️⃣ Resume or start crawl
+      - name: Run crawler (resumable)
         env:
           POSTGRES_HOST: 127.0.0.1
           POSTGRES_USER: postgres
@@ -76,38 +78,41 @@ jobs:
           POSTGRES_DB: postgres
           GITHUB_TOKEN: ${{ github.token }}
         run: |
-          echo "🚀 Running crawler for 100,000 repositories..."
+          echo "🚀 Starting or resuming crawl..."
           python src/crawler/crawler.py
-          echo "✅ Crawler completed successfully."
+          echo "✅ Crawl finished or checkpoint saved."
 
-      # 7️⃣ Export data to CSV
-      - name: Export database to CSV
+      # 7️⃣ Export CSV snapshot
+      - name: Export database snapshot
         env:
           PGPASSWORD: postgres
         run: |
           mkdir -p data
-          echo "📤 Exporting database to data/repos.csv..."
+          echo "📤 Exporting repositories table..."
           psql -h 127.0.0.1 -U postgres -d postgres -c "\copy (SELECT * FROM repositories) TO 'data/repos.csv' CSV HEADER"
-          echo "✅ Export done."
+          echo "✅ Export complete."
 
-      # 8️⃣ Commit and push CSV to repo
+      # 8️⃣ Commit & push data (optional)
       - name: Commit and push CSV results
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           git add data/repos.csv
           if git diff --cached --quiet; then
-            echo "🟡 No changes to commit."
+            echo "🟡 No new data to commit."
           else
-            git commit -m "📊 Auto-update: GitHub repos crawl on $(date -u +"%Y-%m-%d %H:%M:%S UTC")"
+            git commit -m "📊 Auto-update: GitHub crawl $(date -u +"%Y-%m-%d %H:%M:%S UTC")"
             git push
-            echo "✅ Data committed and pushed to repo."
+            echo "✅ Data committed and pushed."
           fi
 
-      # 9️⃣ Upload artifact (for manual download)
+      # 9️⃣ Upload artifact for manual verification
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: github-repos
           path: data/repos.csv
           if-no-files-found: error
+
+    volumes:
+      postgres-data:  # Volume to persist PostgreSQL data between runs
