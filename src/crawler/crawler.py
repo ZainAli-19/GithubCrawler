@@ -2,7 +2,6 @@ import os
 import time
 import logging
 from crawler.graphql_client import GitHubClient
-from db.insertions import insert_repositories
 
 CHECKPOINT_FILE = "data/checkpoint.txt"
 TOTAL_TARGET = 100_000  # Target number of repositories
