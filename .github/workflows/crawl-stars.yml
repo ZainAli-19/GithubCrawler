@@ -79,7 +79,7 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
           echo "🚀 Starting or resuming crawl..."
-          python src/crawler/crawler.py
+          python -m src.crawler.crawler
           echo "✅ Crawl finished or checkpoint saved."
 
       # 7️⃣ Export CSV snapshot
