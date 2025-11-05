@@ -7,6 +7,21 @@ jobs:
   crawl:
     runs-on: ubuntu-latest
 
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -19,21 +34,14 @@ jobs:
       - name: Install dependencies
         run: pip install -r src/requirements.txt
 
-      # 🟢 Start PostgreSQL service built into the runner
-      - name: Start PostgreSQL service
+      # 🕒 Wait until the PostgreSQL service is ready
+      - name: Wait for PostgreSQL to be ready
+        env:
+          PGPASSWORD: postgres
         run: |
-          echo "🚀 Starting built-in PostgreSQL service..."
-          sudo service postgresql start
-          sudo -u postgres psql -c "ALTER USER postgres PASSWORD 'postgres';"
-          sudo -u postgres createdb postgres
-          echo "✅ PostgreSQL started successfully."
-
-      # 🕒 Wait for PostgreSQL to be ready
-      - name: Wait for PostgreSQL to be available
-        run: |
-          echo "⏳ Waiting for PostgreSQL to accept connections..."
+          echo "⏳ Waiting for PostgreSQL to be ready..."
           for i in {1..15}; do
-            if pg_isready -h localhost -p 5432 -U postgres; then
+            if pg_isready -h postgres -p 5432 -U postgres; then
               echo "✅ PostgreSQL is ready!"
               break
             else
@@ -42,17 +50,19 @@ jobs:
             fi
           done
 
+      # 🧱 Create database schema
       - name: Setup database schema
         env:
           PGPASSWORD: postgres
         run: |
-          echo "📦 Creating tables..."
-          psql -h localhost -U postgres -d postgres -f src/db/migrations/001_create_tables.sql
+          echo "📦 Creating tables in PostgreSQL..."
+          psql -h postgres -U postgres -d postgres -f src/db/migrations/001_create_tables.sql
           echo "✅ Tables created successfully."
 
+      # 🚀 Run crawler script
       - name: Run crawler
         env:
-          POSTGRES_HOST: localhost
+          POSTGRES_HOST: postgres        # ✅ Correct host
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
           POSTGRES_DB: postgres
@@ -60,16 +70,18 @@ jobs:
         run: |
           echo "🚀 Starting GitHub crawler..."
           python src/app.py
-          echo "✅ Crawler finished."
+          echo "✅ Crawler finished successfully."
 
+      # 📤 Export database to CSV
       - name: Export database to CSV
         env:
           PGPASSWORD: postgres
         run: |
-          echo "📤 Exporting database to CSV..."
-          psql -h localhost -U postgres -d postgres -c "\copy (SELECT * FROM repositories) TO 'repos.csv' CSV HEADER"
+          echo "📤 Exporting database contents to repos.csv..."
+          psql -h postgres -U postgres -d postgres -c "\copy (SELECT * FROM repositories) TO 'repos.csv' CSV HEADER"
           echo "✅ Export complete."
 
+      # 💾 Upload artifact to workflow output
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
