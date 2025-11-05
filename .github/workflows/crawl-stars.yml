@@ -34,14 +34,14 @@ jobs:
       - name: Install dependencies
         run: pip install -r src/requirements.txt
 
-      # ✅ Added a "wait for Postgres" check before running the schema
+      # ✅ Wait for Postgres and connect using service hostname "postgres"
       - name: Setup database schema
         env:
           PGPASSWORD: postgres
         run: |
           echo "⏳ Waiting for Postgres to be ready..."
           for i in {1..15}; do
-            if pg_isready -h localhost -p 5432 -U postgres; then
+            if pg_isready -h postgres -p 5432 -U postgres; then
               echo "✅ Postgres is ready!"
               break
             else
@@ -50,12 +50,12 @@ jobs:
             fi
           done
           echo "📦 Creating tables..."
-          psql -h localhost -U postgres -d postgres -f src/db/migrations/001_create_tables.sql
+          psql -h postgres -U postgres -d postgres -f src/db/migrations/001_create_tables.sql
           echo "✅ Tables created successfully."
 
       - name: Run crawler
         env:
-          POSTGRES_HOST: localhost
+          POSTGRES_HOST: postgres   # ✅ changed from localhost
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
           POSTGRES_DB: postgres
@@ -70,7 +70,7 @@ jobs:
           PGPASSWORD: postgres
         run: |
           echo "📤 Exporting database to CSV..."
-          psql -h localhost -U postgres -d postgres -c "\copy (SELECT * FROM repositories) TO 'repos.csv' CSV HEADER"
+          psql -h postgres -U postgres -d postgres -c "\copy (SELECT * FROM repositories) TO 'repos.csv' CSV HEADER"
           echo "✅ Export complete."
 
       - name: Upload artifact
