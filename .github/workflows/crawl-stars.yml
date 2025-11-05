@@ -77,7 +77,7 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
           echo "🚀 Running crawler for 100,000 repositories..."
-          python src\crawler\crawler.py
+          python src/crawler/crawler.py
           echo "✅ Crawler completed successfully."
 
       # 7️⃣ Export data to CSV
