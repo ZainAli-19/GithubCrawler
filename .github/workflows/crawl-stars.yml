@@ -1,11 +1,14 @@
 name: Crawl Stars
 
 on:
-  workflow_dispatch:
+  workflow_dispatch:   # Manual trigger
+  schedule:
+    - cron: "0 0 * * *"   # ⏰ Run daily at midnight UTC
 
 jobs:
   crawl:
     runs-on: ubuntu-latest
+    timeout-minutes: 360   # allow long crawl (up to 6 hours)
 
     services:
       postgres:
@@ -23,24 +26,29 @@ jobs:
           --health-retries 10
 
     steps:
+      # 1️⃣ Checkout repository
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          persist-credentials: true  # Required for committing back to repo
 
+      # 2️⃣ Set up Python
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
           python-version: '3.10'
 
+      # 3️⃣ Install dependencies
       - name: Install dependencies
         run: pip install -r src/requirements.txt
 
-      # 🕒 Wait until PostgreSQL is ready
+      # 4️⃣ Wait for PostgreSQL
       - name: Wait for PostgreSQL to be ready
         env:
           PGPASSWORD: postgres
         run: |
           echo "⏳ Waiting for PostgreSQL to be ready..."
-          for i in {1..15}; do
+          for i in {1..20}; do
             if pg_isready -h 127.0.0.1 -p 5432 -U postgres; then
               echo "✅ PostgreSQL is ready!"
               break
@@ -50,7 +58,7 @@ jobs:
             fi
           done
 
-      # 🧱 Create schema
+      # 5️⃣ Setup database schema
       - name: Setup database schema
         env:
           PGPASSWORD: postgres
@@ -59,7 +67,7 @@ jobs:
           psql -h 127.0.0.1 -U postgres -d postgres -f src/db/migrations/001_create_tables.sql
           echo "✅ Tables created successfully."
 
-      # 🚀 Run crawler
+      # 6️⃣ Run crawler (100,000 repos)
       - name: Run crawler
         env:
           POSTGRES_HOST: 127.0.0.1
@@ -68,22 +76,38 @@ jobs:
           POSTGRES_DB: postgres
           GITHUB_TOKEN: ${{ github.token }}
         run: |
-          echo "🚀 Running crawler..."
-          python src/app.py
-          echo "✅ Crawler completed."
+          echo "🚀 Running crawler for 100,000 repositories..."
+          python src/crawler.py
+          echo "✅ Crawler completed successfully."
 
-      # 📤 Export data to CSV
+      # 7️⃣ Export data to CSV
       - name: Export database to CSV
         env:
           PGPASSWORD: postgres
         run: |
-          echo "📤 Exporting database to repos.csv..."
-          psql -h 127.0.0.1 -U postgres -d postgres -c "\copy (SELECT * FROM repositories) TO 'repos.csv' CSV HEADER"
+          mkdir -p data
+          echo "📤 Exporting database to data/repos.csv..."
+          psql -h 127.0.0.1 -U postgres -d postgres -c "\copy (SELECT * FROM repositories) TO 'data/repos.csv' CSV HEADER"
           echo "✅ Export done."
 
-      # 💾 Upload artifact
+      # 8️⃣ Commit and push CSV to repo
+      - name: Commit and push CSV results
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/repos.csv
+          if git diff --cached --quiet; then
+            echo "🟡 No changes to commit."
+          else
+            git commit -m "📊 Auto-update: GitHub repos crawl on $(date -u +"%Y-%m-%d %H:%M:%S UTC")"
+            git push
+            echo "✅ Data committed and pushed to repo."
+          fi
+
+      # 9️⃣ Upload artifact (for manual download)
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: github-repos
-          path: repos.csv
+          path: data/repos.csv
+          if-no-files-found: error
