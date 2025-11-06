@@ -26,23 +26,20 @@ GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 # ────────────────────────────────────────────────
 # Constants
 # ────────────────────────────────────────────────
-TOTAL_TARGET = 100_000  # total repos to collect
+TOTAL_TARGET = 100_000
 BATCH_SIZE = 100
 WORKERS = 5
 MAX_RETRIES = 5
-
-# Each worker crawls a specific star range (for diversity)
-WORKER_QUERIES = [
+BASE_QUERIES = [
     "stars:>10000",
     "stars:5000..9999",
     "stars:1000..4999",
     "stars:100..999",
-    "stars:1..99"
+    "stars:1..99",
 ]
 
-
 # ────────────────────────────────────────────────
-# Utility functions
+# Utils
 # ────────────────────────────────────────────────
 def parse_datetime(ts: str):
     """Convert ISO8601 string to datetime.datetime or return None."""
@@ -56,10 +53,9 @@ def parse_datetime(ts: str):
 
 
 # ────────────────────────────────────────────────
-# Database helpers
+# DB helpers
 # ────────────────────────────────────────────────
 async def init_db_pool():
-    """Initialize PostgreSQL connection pool."""
     return await asyncpg.create_pool(
         user=POSTGRES_USER,
         password=POSTGRES_PASSWORD,
@@ -71,7 +67,7 @@ async def init_db_pool():
 
 
 async def insert_batch(pool, nodes):
-    """Insert a batch of repositories into PostgreSQL."""
+    """Insert batch safely into DB."""
     async with pool.acquire() as conn:
         async with conn.transaction():
             for repo in nodes:
@@ -99,64 +95,79 @@ async def insert_batch(pool, nodes):
                         repo["url"],
                     )
                 except Exception as e:
-                    logging.warning(f"⚠️ Skipped repo due to DB error: {e}")
+                    logging.warning(f"⚠️ DB insert skip: {e}")
+
+
+async def get_repo_count(pool):
+    async with pool.acquire() as conn:
+        val = await conn.fetchval("SELECT COUNT(*) FROM repositories;")
+        return val or 0
 
 
 # ────────────────────────────────────────────────
-# Worker Task
+# Crawl logic
 # ────────────────────────────────────────────────
-async def crawl_slice(query: str, pool, client: GitHubGraphQLClient, target_per_worker: int):
-    """Crawl one slice of the repository space."""
+async def crawl_range(query: str, pool, client, stop_event: asyncio.Event):
+    """Crawl a given search query until no pages left or stop_event is set."""
     cursor = None
     total = 0
-    pages = 0
-
-    logging.info(f"🧵 Starting worker for query: {query}")
-
-    for attempt in range(MAX_RETRIES):
+    page = 0
+    while not stop_event.is_set():
         try:
-            while total < target_per_worker:
-                data = await client.fetch_repos(query, cursor)
-                if not data:
-                    logging.warning(f"⚠️ Empty response for {query}, retrying...")
-                    await asyncio.sleep(3)
-                    continue
+            data = await client.fetch_repos(query, cursor)
+            if not data:
+                break
+            nodes = data.get("nodes", [])
+            if not nodes:
+                break
 
-                nodes = data.get("nodes", [])
-                if not nodes:
-                    break
+            await insert_batch(pool, nodes)
+            total += len(nodes)
+            page += 1
+            logging.info(f"📦 [{query}] page {page}, total {total}")
 
-                await insert_batch(pool, nodes)
-                total += len(nodes)
-                pages += 1
+            page_info = data.get("pageInfo", {})
+            if not page_info.get("hasNextPage"):
+                break
+            cursor = page_info.get("endCursor")
 
-                logging.info(f"📦 Worker [{query}] — page {pages}, total {total}")
-
-                page_info = data.get("pageInfo", {})
-                if not page_info.get("hasNextPage"):
-                    logging.info(f"✅ Worker [{query}] finished (no more pages).")
-                    break
-
-                cursor = page_info.get("endCursor")
-
-                # Respect GitHub API rate limits
-                await asyncio.sleep(1.2)
-
-            break  # success, stop retrying
+            await asyncio.sleep(1.2)
         except Exception as e:
-            logging.error(f"❌ Worker [{query}] failed attempt {attempt+1}: {e}")
-            await asyncio.sleep(2 ** attempt)
-    else:
-        logging.error(f"❌ Worker [{query}] gave up after {MAX_RETRIES} retries.")
+            logging.warning(f"⚠️ Range [{query}] failed: {e}")
+            await asyncio.sleep(3)
+    return total
 
-    logging.info(f"🏁 Worker [{query}] completed with {total} repos.")
+
+async def crawl_worker(base_query: str, pool, client, stop_event: asyncio.Event, worker_id: int):
+    """One worker dynamically exploring sub-ranges."""
+    step = 100  # dynamic subrange star step (used only for <1000 ranges)
+    total = 0
+    logging.info(f"🧵 Worker {worker_id} starting on {base_query}")
+
+    # Expand low-star queries to cover more repos
+    if base_query.startswith("stars:1.."):
+        low, high = 1, 999
+        while not stop_event.is_set() and low < high:
+            sub_q = f"stars:{low}..{low+step-1}"
+            got = await crawl_range(sub_q, pool, client, stop_event)
+            total += got
+            low += step
+            count = await get_repo_count(pool)
+            logging.info(f"Worker {worker_id}: DB={count}, subrange={sub_q}")
+            if count >= TOTAL_TARGET:
+                stop_event.set()
+                break
+    else:
+        await crawl_range(base_query, pool, client, stop_event)
+
+    logging.info(f"🏁 Worker {worker_id} done — crawled ~{total} repos.")
 
 
 # ────────────────────────────────────────────────
-# Main Entrypoint
+# Entrypoint
 # ────────────────────────────────────────────────
 async def main():
-    logging.info("🚀 Starting async GitHub crawler for 100,000 repositories...")
+    logging.info(f"🚀 Starting async GitHub crawler aiming for {TOTAL_TARGET} repos...")
 
     if not GITHUB_TOKEN:
         raise ValueError("❌ Missing GITHUB_TOKEN environment variable.")
@@ -165,18 +176,27 @@ async def main():
         client = GitHubGraphQLClient(GITHUB_TOKEN, session)
         pool = await init_db_pool()
 
-        target_per_worker = TOTAL_TARGET // WORKERS
-
-        # Launch all worker tasks
+        stop_event = asyncio.Event()
         tasks = [
-            asyncio.create_task(crawl_slice(q, pool, client, target_per_worker))
-            for q in WORKER_QUERIES
+            asyncio.create_task(crawl_worker(q, pool, client, stop_event, i + 1))
+            for i, q in enumerate(BASE_QUERIES)
         ]
 
+        # Watch DB count concurrently
+        async def watcher():
+            while not stop_event.is_set():
+                count = await get_repo_count(pool)
+                if count >= TOTAL_TARGET:
+                    logging.info(f"🎯 Target reached: {count} repos.")
+                    stop_event.set()
+                    break
+                await asyncio.sleep(30)
+
+        tasks.append(asyncio.create_task(watcher()))
         await asyncio.gather(*tasks)
         await pool.close()
 
-    logging.info("🎉 All workers finished — crawl complete (≈100,000 repos).")
+    logging.info("🎉 Crawl complete — database has ≥100 000 repositories.")
 
 
 if __name__ == "__main__":
