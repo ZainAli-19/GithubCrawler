@@ -8,6 +8,7 @@ import asyncpg
 from crawler.graphql_client import GitHubGraphQLClient
 import math
 from asyncio import Queue
+import itertools
 
 
 logging.basicConfig(
@@ -151,7 +152,39 @@ async def crawl_range(query, pool, client, stop_event):
     return total
 
 
-async def adaptive_crawl_worker(queue: Queue, pool, client, stop_event, worker_id: int):
+# --- Query pool generation for maximum diversity ---
+SUPPORTED_LANGUAGES = [
+    'Python', 'JavaScript', 'Java', 'Go', 'C++', 'TypeScript', 'Ruby', 'PHP', 'C#', 'C', 'Rust', 'Kotlin',
+    'Swift', 'Scala', 'Objective-C', 'Shell', 'Dart', 'R', 'Perl', 'Elixir', 'Haskell', 'Julia'
+]
+
+TOPIC_SAMPLES = ['machine-learning', 'web', 'cli', 'api', 'game', 'data', 'blockchain', 'test', 'image', 'video']
+
+STAR_BUCKS = []
+# Logarithmic star slices: tight at low, wider up top
+for start in range(1, 1500, 20):
+    STAR_BUCKS.append(f"stars:{start}..{start+19}")
+for start in range(1500, 5000, 50):
+    STAR_BUCKS.append(f"stars:{start}..{start+49}")
+for start in range(5000, 30000, 250):
+    STAR_BUCKS.append(f"stars:{start}..{start+249}")
+for start in range(30000, 100000, 1000):
+    STAR_BUCKS.append(f"stars:{start}..{start+999}")
+STAR_BUCKS += [f"stars:>{v}" for v in (100000, 250000, 500000)]
+
+# By language (mix star cutoff)
+LANG_STAR = [f"language:{lang} stars:>10" for lang in SUPPORTED_LANGUAGES]
+# By topic (mix star cutoff)
+TOPIC_STAR = [f"topic:{tp} stars:>10" for tp in TOPIC_SAMPLES]
+# By creation year
+DATE_RANGES = [f"created:{year}-01-01..{year}-12-31 stars:>10" for year in range(2008, datetime.now().year+1)]
+
+# Aggregate & shuffle
+QUERY_POOL = STAR_BUCKS + LANG_STAR + TOPIC_STAR + DATE_RANGES
+random.shuffle(QUERY_POOL)
+
+# --- Worker logic: pop and crawl all pooled queries until DB >= 100K ---
+async def diverse_crawl_worker(queue: Queue, pool, client, stop_event, worker_id: int):
     total_inserted = 0
     while not stop_event.is_set():
         try:
@@ -160,12 +193,10 @@ async def adaptive_crawl_worker(queue: Queue, pool, client, stop_event, worker_i
             break
         if bucket is None:
             break
-        lo, hi = bucket
-        query = f'stars:{lo}..{hi}'
+        query = bucket
         cursor = None
         fetched = 0
         seen_ids = set()
-        should_split = False
         while not stop_event.is_set():
             async with RATE_LOCK:
                 await asyncio.sleep(RATE_DELAY + random.uniform(0.5, 1.5))
@@ -174,11 +205,8 @@ async def adaptive_crawl_worker(queue: Queue, pool, client, stop_event, worker_i
                 break
             nodes = data.get("nodes", [])
             page_info = data.get("pageInfo", {})
-            if len(nodes) >= 1000:
-                should_split = True
-                break  # There are more, need to split bucket
             if nodes:
-                # Dedup in-bucket, avoids rare dupe-bugs
+                # Dedup in-bucket, avoids rare bug
                 new_nodes = [n for n in nodes if n["id"] not in seen_ids]
                 for n in new_nodes:
                     seen_ids.add(n["id"])
@@ -189,21 +217,15 @@ async def adaptive_crawl_worker(queue: Queue, pool, client, stop_event, worker_i
             if not page_info.get("hasNextPage"):
                 break
             cursor = page_info.get("endCursor")
-        # Bucket needs splitting if any page hit exactly 1000
-        if should_split and hi - lo > 1:
-            mid = (lo + hi) // 2
-            await queue.put((lo, mid))
-            await queue.put((mid+1, hi))
-            logging.info(f"[W{worker_id}] Splitting {query} → ({lo}..{mid}), ({mid+1}..{hi})")
         count = await get_repo_count(pool)
         if count >= TOTAL_TARGET or stop_event.is_set():
             stop_event.set()
             break
         queue.task_done()
-    logging.info(f"[W{worker_id}] Finished adaptive crawl, total inserted: {total_inserted}")
+    logging.info(f"[W{worker_id}] Finished diverse crawl, total inserted: {total_inserted}")
 
 async def main():
-    logging.info(f"Starting adaptive async GitHub crawler (target={TOTAL_TARGET:,})")
+    logging.info(f"Starting diverse async GitHub crawler (target={TOTAL_TARGET:,})")
     if not GITHUB_TOKEN:
         raise ValueError("Missing GITHUB_TOKEN environment variable")
     pool = await init_db_pool()
@@ -211,18 +233,9 @@ async def main():
         client = GitHubGraphQLClient(GITHUB_TOKEN, session)
         stop_event = asyncio.Event()
         bucket_queue = Queue()
-        # Use small increments for wide coverage; can tune for upper limit
-        bucket_ranges = []
-        # Fine-grained for low stars, wider for high (can add more adaptively)
-        bucket_ranges += [(1,99)]
-        bucket_ranges += [(100, 199), (200, 299), (300, 399), (400, 499), (500, 999)]
-        for start in range(1000, 20000, 100):
-            bucket_ranges.append((start, min(start+99,19999)))
-        # Super-wide slices above 20K stars
-        bucket_ranges += [(20000, 49999), (50000, 100000)]
-        for buck in bucket_ranges:
-            await bucket_queue.put(buck)
-        workers = [asyncio.create_task(adaptive_crawl_worker(bucket_queue, pool, client, stop_event, i+1)) for i in range(WORKERS)]
+        for q in QUERY_POOL:
+            await bucket_queue.put(q)
+        workers = [asyncio.create_task(diverse_crawl_worker(bucket_queue, pool, client, stop_event, i+1)) for i in range(WORKERS)]
         async def watcher():
             while not stop_event.is_set():
                 count = await get_repo_count(pool)
