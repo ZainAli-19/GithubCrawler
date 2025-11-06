@@ -64,17 +64,15 @@ jobs:
             fi
           done
 
-      # 5️⃣ Apply all migrations (001, 002, ...)
+      # 5️⃣ Recreate database schema (single migration file)
       - name: Setup database schema
         env:
           PGPASSWORD: postgres
         run: |
-          echo "📦 Applying database migrations..."
-          for file in $(ls src/db/migrations/*.sql | sort); do
-            echo "▶️ Running migration: $file"
-            psql -h 127.0.0.1 -U postgres -d postgres -f "$file"
-          done
-          echo "✅ All migrations applied."
+          echo "📦 Recreating database schema..."
+          psql -h 127.0.0.1 -U postgres -d postgres -c "DROP TABLE IF EXISTS repositories, crawl_logs CASCADE;"
+          psql -h 127.0.0.1 -U postgres -d postgres -f src/db/migrations/001_create_tables.sql
+          echo "✅ Database schema ready."
 
       # 6️⃣ Run Async Parallel Crawler
       - name: Run async parallel crawler
@@ -113,6 +111,7 @@ jobs:
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          mkdir -p data
           git add data/repos.csv
           if git diff --cached --quiet; then
             echo "🟡 No new data to commit."

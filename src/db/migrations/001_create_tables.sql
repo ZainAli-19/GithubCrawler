@@ -1,20 +1,22 @@
--- src/db/migrations/001_create_tables.sql
-CREATE TABLE IF NOT EXISTS repositories (
-    id BIGINT PRIMARY KEY,
+-- 001_create_tables.sql
+DROP TABLE IF EXISTS repositories;
+DROP TABLE IF EXISTS crawl_logs;
+
+CREATE TABLE repositories (
+    repo_id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
-    owner TEXT NOT NULL,
-    stars INT,
-    forks INT,  -- ✅ Added this missing column
-    created_at TIMESTAMPTZ,
-    updated_at TIMESTAMPTZ,
-    pushed_at TIMESTAMPTZ,
-    url TEXT
+    stars INTEGER DEFAULT 0,
+    forks INTEGER DEFAULT 0,
+    url TEXT,
+    owner TEXT,
+    last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE TABLE IF NOT EXISTS crawl_logs (
+CREATE TABLE crawl_logs (
     id SERIAL PRIMARY KEY,
-    started_at TIMESTAMPTZ DEFAULT NOW(),
-    finished_at TIMESTAMPTZ,
-    total_repos INT,
-    notes TEXT
+    run_id TEXT,
+    started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    completed_at TIMESTAMP,
+    repos_crawled INTEGER DEFAULT 0,
+    status TEXT
 );
