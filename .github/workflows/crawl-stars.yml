@@ -1,14 +1,14 @@
 name: Crawl Stars
 
 on:
-  workflow_dispatch:    # Manual trigger from Actions tab
+  workflow_dispatch:     # ✅ Manual trigger
   schedule:
-    - cron: "0 0 * * *"  # Run daily at midnight UTC
+    - cron: "0 0 * * *"  # ✅ Run daily at midnight UTC
 
 jobs:
   crawl:
     runs-on: ubuntu-latest
-    timeout-minutes: 360   # Allow up to 6 hours for the full crawl
+    timeout-minutes: 360   # Allow up to 6 hours
 
     services:
       postgres:
@@ -25,14 +25,14 @@ jobs:
           --health-timeout 5s
           --health-retries 10
         volumes:
-          - postgres-data:/var/lib/postgresql/data  # ✅ Persistent DB storage between runs
+          - postgres-data:/var/lib/postgresql/data  # ✅ Persist DB between runs
 
     steps:
       # 1️⃣ Checkout repository
-      - name: Checkout code
+      - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          persist-credentials: true  # Required for pushing CSV later
+          persist-credentials: true
 
       # 2️⃣ Set up Python
       - name: Set up Python
@@ -44,8 +44,8 @@ jobs:
       - name: Install dependencies
         run: pip install -r src/requirements.txt
 
-      # 4️⃣ Wait for PostgreSQL
-      - name: Wait for PostgreSQL to be ready
+      # 4️⃣ Wait for PostgreSQL to be ready
+      - name: Wait for PostgreSQL
         env:
           PGPASSWORD: postgres
         run: |
@@ -60,41 +60,40 @@ jobs:
             fi
           done
 
-      # 5️⃣ Setup schema (only if not exists)
-      - name: Initialize database schema
+      # 5️⃣ Setup database schema
+      - name: Setup database schema
         env:
           PGPASSWORD: postgres
         run: |
-          echo "📦 Ensuring tables exist..."
+          echo "📦 Setting up database schema..."
           psql -h 127.0.0.1 -U postgres -d postgres -f src/db/migrations/001_create_tables.sql
-          echo "✅ Schema ready."
+          echo "✅ Schema setup complete."
 
-      # 6️⃣ Run or resume crawl
+      # 6️⃣ Run or Resume Crawl
       - name: Run crawler (resumable)
         env:
           POSTGRES_HOST: 127.0.0.1
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
           POSTGRES_DB: postgres
-          GITHUB_TOKEN: ${{ github.token }}
-          PYTHONPATH: src   
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          echo "🚀 Starting or resuming crawl..."
+          echo "🚀 Starting or resuming crawl from last checkpoint..."
           python -m src.crawler.crawler
-          echo "✅ Crawl finished or checkpoint saved."
+          echo "✅ Crawl finished or checkpoint updated."
 
-      # 7️⃣ Export CSV snapshot
-      - name: Export database snapshot
+      # 7️⃣ Export Database Snapshot to CSV
+      - name: Export repositories to CSV
         env:
           PGPASSWORD: postgres
         run: |
           mkdir -p data
           echo "📤 Exporting repositories table..."
-          psql -h 127.0.0.1 -U postgres -d postgres -c "\copy (SELECT * FROM repositories) TO 'data/repos.csv' CSV HEADER"
+          psql -h 127.0.0.1 -U postgres -d postgres -c "\copy (SELECT * FROM repositories ORDER BY stars DESC) TO 'data/repos.csv' CSV HEADER"
           echo "✅ Export complete."
 
-      # 8️⃣ Commit & push data
-      - name: Commit and push CSV results
+      # 8️⃣ Commit and Push Data Updates
+      - name: Commit and push updated data
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
@@ -102,15 +101,18 @@ jobs:
           if git diff --cached --quiet; then
             echo "🟡 No new data to commit."
           else
-            git commit -m "📊 Auto-update: GitHub crawl $(date -u +"%Y-%m-%d %H:%M:%S UTC")"
+            git commit -m "📊 Auto-update: GitHub repos crawl on $(date -u +"%Y-%m-%d %H:%M:%S UTC")"
             git push
             echo "✅ Data committed and pushed."
           fi
 
-      # 9️⃣ Upload artifact for manual download
-      - name: Upload artifact
+      # 9️⃣ Upload Artifact for Manual Download
+      - name: Upload artifact (repos.csv)
         uses: actions/upload-artifact@v4
         with:
           name: github-repos
           path: data/repos.csv
           if-no-files-found: error
+
+    volumes:
+      postgres-data:
