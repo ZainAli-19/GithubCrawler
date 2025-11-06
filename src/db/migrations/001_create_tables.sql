@@ -1,22 +1,25 @@
 -- 001_create_tables.sql
-DROP TABLE IF EXISTS repositories;
-DROP TABLE IF EXISTS crawl_logs;
+
+DROP TABLE IF EXISTS repositories CASCADE;
+DROP TABLE IF EXISTS crawl_logs CASCADE;
 
 CREATE TABLE repositories (
-    repo_id TEXT PRIMARY KEY,
+    id BIGINT PRIMARY KEY,
     name TEXT NOT NULL,
-    stars INTEGER DEFAULT 0,
-    forks INTEGER DEFAULT 0,
-    url TEXT,
-    owner TEXT,
-    last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    owner TEXT NOT NULL,
+    stars INTEGER NOT NULL DEFAULT 0,
+    forks INTEGER NOT NULL DEFAULT 0,
+    created_at TIMESTAMP,
+    updated_at TIMESTAMP,
+    pushed_at TIMESTAMP,
+    url TEXT
 );
 
 CREATE TABLE crawl_logs (
     id SERIAL PRIMARY KEY,
-    run_id TEXT,
-    started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    completed_at TIMESTAMP,
-    repos_crawled INTEGER DEFAULT 0,
-    status TEXT
+    worker_name TEXT,
+    range_label TEXT,
+    success BOOLEAN,
+    attempted_at TIMESTAMP DEFAULT NOW(),
+    error_message TEXT
 );
