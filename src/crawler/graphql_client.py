@@ -1,14 +1,15 @@
 import asyncio
 import logging
 import aiohttp
+from datetime import datetime, timezone
 
 # ────────────────────────────────────────────────
-# GitHub GraphQL Client
+# GitHub GraphQL Client (with rate-limit tracking)
 # ────────────────────────────────────────────────
 class GitHubGraphQLClient:
     """
-    A lightweight asynchronous client for querying the GitHub GraphQL API.
-    Handles retries, rate limits, and pagination.
+    Optimized asynchronous client for GitHub GraphQL API.
+    Includes rate-limit tracking and intelligent retry logic.
     """
 
     API_URL = "https://api.github.com/graphql"
@@ -19,9 +20,17 @@ class GitHubGraphQLClient:
         self.token = token
         self.session = session
 
-    # Correct query for Repository-only search (fixes union selection errors)
+    # ────────────────────────────────────────────────
+    # Query with rate-limit info
+    # ────────────────────────────────────────────────
     QUERY = """
     query ($queryString: String!, $cursor: String) {
+      rateLimit {
+        limit
+        cost
+        remaining
+        resetAt
+      }
       search(query: $queryString, type: REPOSITORY, first: 100, after: $cursor) {
         pageInfo {
           endCursor
@@ -31,30 +40,29 @@ class GitHubGraphQLClient:
           ... on Repository {
             id
             name
-            owner {
-              login
-            }
+            owner { login }
             stargazerCount
             forkCount
             createdAt
             updatedAt
             pushedAt
             url
-            primaryLanguage {
-              name
-            }
+            primaryLanguage { name }
           }
         }
       }
     }
     """
 
+    # ────────────────────────────────────────────────
+    # Fetch repositories
+    # ────────────────────────────────────────────────
     async def fetch_repos(self, query_string: str, cursor: str = None):
         """
-        Fetch a batch of repositories for a given search query.
+        Fetch one batch of repositories and log rate-limit status.
         Retries automatically on transient or rate-limit errors.
         """
-        for attempt in range(5):
+        for attempt in range(6):
             try:
                 async with self.session.post(
                     self.API_URL,
@@ -65,13 +73,13 @@ class GitHubGraphQLClient:
                     },
                 ) as resp:
 
-                    # Retry on server or rate limit errors
+                    # ─── Retry logic based on response status ───
                     if resp.status == 403:
                         logging.warning("⏳ Hit GitHub rate limit — sleeping 60s...")
                         await asyncio.sleep(60)
                         continue
                     elif resp.status >= 500:
-                        logging.warning(f"⚠️ GitHub server error ({resp.status})")
+                        logging.warning(f"⚠️ GitHub server error ({resp.status}) — retrying...")
                         await asyncio.sleep(5)
                         continue
                     elif resp.status != 200:
@@ -87,9 +95,26 @@ class GitHubGraphQLClient:
                         await asyncio.sleep(5)
                         continue
 
+                    # ─── Extract and log rate-limit information ───
+                    rl = data.get("data", {}).get("rateLimit")
+                    if rl:
+                        reset_time = datetime.strptime(
+                            rl["resetAt"], "%Y-%m-%dT%H:%M:%SZ"
+                        ).replace(tzinfo=timezone.utc)
+                        minutes_left = (reset_time - datetime.now(timezone.utc)).total_seconds() / 60
+                        logging.info(
+                            f"⏱ Rate limit: {rl['remaining']}/{rl['limit']} left "
+                            f"(cost={rl['cost']}) — resets in {minutes_left:.1f} min"
+                        )
+
+                        # Back off slightly if near exhaustion
+                        if rl["remaining"] < 50:
+                            logging.warning("🛑 Near rate-limit exhaustion — pausing 90s...")
+                            await asyncio.sleep(90)
+
                     search_data = data.get("data", {}).get("search")
                     if not search_data:
-                        logging.warning("⚠️ Empty or invalid response from GitHub.")
+                        logging.warning("⚠️ Empty or invalid search response — retrying...")
                         await asyncio.sleep(3)
                         continue
 
