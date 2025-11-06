@@ -1,6 +1,7 @@
 import os
 import asyncio
 import logging
+import random
 from datetime import datetime, timezone
 import aiohttp
 import asyncpg
@@ -29,7 +30,7 @@ GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 TOTAL_TARGET = 100_000
 WORKERS = 8
 INSERT_BATCH_SIZE = 300
-RATE_DELAY = 0.8
+RATE_DELAY = 2.0
 
 BASE_QUERIES = [
     "stars:>20000",
@@ -145,7 +146,8 @@ async def crawl_range(query, pool, client, stop_event):
                 break
             cursor = page_info.get("endCursor")
 
-            await asyncio.sleep(RATE_DELAY)
+            await asyncio.sleep(RATE_DELAY + random.uniform(0.3, 0.8))
+
 
         except asyncio.CancelledError:
             break
@@ -187,11 +189,11 @@ async def main():
     async with aiohttp.ClientSession() as session:
         client = GitHubGraphQLClient(GITHUB_TOKEN, session)
         stop_event = asyncio.Event()
+        workers = []
+        for i, q in enumerate(BASE_QUERIES):
+            await asyncio.sleep(i * 1.5)  # stagger each worker by 1.5s
+            workers.append(asyncio.create_task(crawl_worker(q, pool, client, stop_event, i + 1)))
 
-        workers = [
-            asyncio.create_task(crawl_worker(q, pool, client, stop_event, i + 1))
-            for i, q in enumerate(BASE_QUERIES)
-        ]
 
         # monitor progress
         async def watcher():
