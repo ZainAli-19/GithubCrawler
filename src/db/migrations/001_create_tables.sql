@@ -1,10 +1,9 @@
 -- 001_create_tables.sql
-
 DROP TABLE IF EXISTS repositories CASCADE;
 DROP TABLE IF EXISTS crawl_logs CASCADE;
 
 CREATE TABLE repositories (
-    id BIGINT PRIMARY KEY,
+    id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
     owner TEXT NOT NULL,
     stars INTEGER NOT NULL DEFAULT 0,
