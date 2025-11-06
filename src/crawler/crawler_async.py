@@ -1,7 +1,7 @@
 import os
 import asyncio
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 import aiohttp
 import asyncpg
 from crawler.graphql_client import GitHubGraphQLClient
@@ -27,13 +27,10 @@ GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 # Constants
 # ────────────────────────────────────────────────
 TOTAL_TARGET = 100_000
-BATCH_SIZE = 100
-WORKERS = 8  # ⚡ increased concurrency safely
-INSERT_BATCH_SIZE = 300  # group inserts for fewer transactions
-RATE_DELAY = 0.8  # reduced sleep (still API-safe)
-MAX_RETRIES = 5
+WORKERS = 8
+INSERT_BATCH_SIZE = 300
+RATE_DELAY = 0.8
 
-# Diverse star ranges to distribute load across GitHub’s data clusters
 BASE_QUERIES = [
     "stars:>20000",
     "stars:10000..19999",
@@ -46,7 +43,7 @@ BASE_QUERIES = [
 ]
 
 # ────────────────────────────────────────────────
-# Utils
+# Utilities
 # ────────────────────────────────────────────────
 def parse_datetime(ts: str):
     if not ts:
@@ -60,7 +57,7 @@ def parse_datetime(ts: str):
 
 
 # ────────────────────────────────────────────────
-# DB helpers
+# Database Helpers
 # ────────────────────────────────────────────────
 async def init_db_pool():
     return await asyncpg.create_pool(
@@ -74,7 +71,6 @@ async def init_db_pool():
 
 
 async def insert_batch(pool, nodes):
-    """Efficient bulk insert for performance."""
     if not nodes:
         return
     async with pool.acquire() as conn:
@@ -114,11 +110,12 @@ async def insert_batch(pool, nodes):
 
 async def get_repo_count(pool):
     async with pool.acquire() as conn:
-        return await conn.fetchval("SELECT COUNT(*) FROM repositories;") or 0
+        val = await conn.fetchval("SELECT COUNT(*) FROM repositories;")
+        return val or 0
 
 
 # ────────────────────────────────────────────────
-# Crawl logic
+# Crawling logic with auto-resume
 # ────────────────────────────────────────────────
 async def crawl_range(query, pool, client, stop_event):
     cursor = None
@@ -128,29 +125,34 @@ async def crawl_range(query, pool, client, stop_event):
         try:
             data = await client.fetch_repos(query, cursor)
             if not data:
-                break
+                logging.warning(f"⚠️ Empty response for {query}, waiting 10s...")
+                await asyncio.sleep(10)
+                continue
 
             nodes = data.get("nodes", [])
-            if not nodes:
-                break
-
-            buffer.extend(nodes)
-            if len(buffer) >= INSERT_BATCH_SIZE:
-                await insert_batch(pool, buffer)
-                total += len(buffer)
-                buffer.clear()
-                logging.info(f"📦 [{query}] Inserted {total:,} so far")
-
             page_info = data.get("pageInfo", {})
+
+            if nodes:
+                buffer.extend(nodes)
+                if len(buffer) >= INSERT_BATCH_SIZE:
+                    await insert_batch(pool, buffer)
+                    total += len(buffer)
+                    buffer.clear()
+                    logging.info(f"📦 [{query}] Inserted {total:,} so far")
+
+            # move to next page or break
             if not page_info.get("hasNextPage"):
                 break
             cursor = page_info.get("endCursor")
+
             await asyncio.sleep(RATE_DELAY)
+
+        except asyncio.CancelledError:
+            break
         except Exception as e:
             logging.warning(f"⚠️ Crawl error in {query}: {e}")
-            await asyncio.sleep(2)
+            await asyncio.sleep(5)
 
-    # Insert remaining items
     if buffer:
         await insert_batch(pool, buffer)
         total += len(buffer)
@@ -159,11 +161,17 @@ async def crawl_range(query, pool, client, stop_event):
 
 async def crawl_worker(base_query, pool, client, stop_event, worker_id):
     logging.info(f"🧵 Worker-{worker_id} → {base_query}")
-    total = await crawl_range(base_query, pool, client, stop_event)
-    count = await get_repo_count(pool)
-    logging.info(f"🏁 Worker-{worker_id} done ({total:,} repos, DB={count:,})")
-    if count >= TOTAL_TARGET:
-        stop_event.set()
+    total = 0
+    while not stop_event.is_set():
+        total += await crawl_range(base_query, pool, client, stop_event)
+        count = await get_repo_count(pool)
+        logging.info(f"✅ Worker-{worker_id}: DB={count:,}, crawled={total:,}")
+        if count >= TOTAL_TARGET:
+            stop_event.set()
+            break
+        logging.info(f"⏳ Worker-{worker_id} waiting 60s before resuming...")
+        await asyncio.sleep(60)  # retry same query (resume next hour if needed)
+    logging.info(f"🏁 Worker-{worker_id} done ({total:,} repos total)")
 
 
 # ────────────────────────────────────────────────
@@ -176,7 +184,6 @@ async def main():
         raise ValueError("❌ Missing GITHUB_TOKEN environment variable")
 
     pool = await init_db_pool()
-
     async with aiohttp.ClientSession() as session:
         client = GitHubGraphQLClient(GITHUB_TOKEN, session)
         stop_event = asyncio.Event()
@@ -186,7 +193,7 @@ async def main():
             for i, q in enumerate(BASE_QUERIES)
         ]
 
-        # watcher to stop early
+        # monitor progress
         async def watcher():
             while not stop_event.is_set():
                 count = await get_repo_count(pool)
@@ -194,7 +201,7 @@ async def main():
                 if count >= TOTAL_TARGET:
                     stop_event.set()
                     break
-                await asyncio.sleep(20)
+                await asyncio.sleep(30)
 
         workers.append(asyncio.create_task(watcher()))
         await asyncio.gather(*workers)
