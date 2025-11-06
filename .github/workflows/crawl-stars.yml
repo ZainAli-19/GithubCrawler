@@ -24,8 +24,6 @@ jobs:
           --health-interval 10s
           --health-timeout 5s
           --health-retries 10
-        volumes:
-          - postgres-data:/var/lib/postgresql/data  # ✅ Persist DB between runs
 
     steps:
       # 1️⃣ Checkout repository
@@ -76,7 +74,7 @@ jobs:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
           POSTGRES_DB: postgres
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           echo "🚀 Starting or resuming crawl from last checkpoint..."
           python -m src.crawler.crawler
@@ -113,6 +111,3 @@ jobs:
           name: github-repos
           path: data/repos.csv
           if-no-files-found: error
-
-    volumes:
-      postgres-data:
