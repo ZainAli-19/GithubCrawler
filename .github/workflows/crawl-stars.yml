@@ -69,6 +69,7 @@ jobs:
 
       # 6️⃣ Run or Resume Crawl
       - name: Run crawler (resumable)
+        working-directory: src
         env:
           POSTGRES_HOST: 127.0.0.1
           POSTGRES_USER: postgres
@@ -77,7 +78,7 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
           echo "🚀 Starting or resuming crawl from last checkpoint..."
-          python -m src.crawler.crawler
+          python -m crawler.crawler
           echo "✅ Crawl finished or checkpoint updated."
 
       # 7️⃣ Export Database Snapshot to CSV
