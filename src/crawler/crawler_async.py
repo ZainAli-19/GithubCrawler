@@ -7,30 +7,22 @@ import aiohttp
 import asyncpg
 from crawler.graphql_client import GitHubGraphQLClient
 
-# ────────────────────────────────────────────────
-# Logging setup
-# ────────────────────────────────────────────────
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(message)s",
 )
 
-# ────────────────────────────────────────────────
-# Environment variables
-# ────────────────────────────────────────────────
 POSTGRES_HOST = os.getenv("POSTGRES_HOST", "localhost")
 POSTGRES_USER = os.getenv("POSTGRES_USER", "postgres")
 POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD", "postgres")
 POSTGRES_DB = os.getenv("POSTGRES_DB", "postgres")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 
-# ────────────────────────────────────────────────
-# Constants
-# ────────────────────────────────────────────────
 TOTAL_TARGET = 100_000
-WORKERS = 5                     # Safe concurrency level (no 403s)
+WORKERS = 5                   
 INSERT_BATCH_SIZE = 300
-RATE_DELAY = 4.5                # Global pacing delay (seconds)
+RATE_DELAY = 2.0               
 MAX_BACKOFF = 10
 
 BASE_QUERIES = [
@@ -44,14 +36,8 @@ BASE_QUERIES = [
     "stars:1..99",
 ]
 
-# ────────────────────────────────────────────────
-# Global rate control semaphore
-# ────────────────────────────────────────────────
 RATE_LOCK = asyncio.Semaphore(1)
 
-# ────────────────────────────────────────────────
-# Utilities
-# ────────────────────────────────────────────────
 def parse_datetime(ts: str):
     if not ts:
         return None
@@ -63,9 +49,6 @@ def parse_datetime(ts: str):
     return None
 
 
-# ────────────────────────────────────────────────
-# Database Helpers
-# ────────────────────────────────────────────────
 async def init_db_pool():
     return await asyncpg.create_pool(
         user=POSTGRES_USER,
@@ -121,9 +104,6 @@ async def get_repo_count(pool):
         return val or 0
 
 
-# ────────────────────────────────────────────────
-# Crawling logic with coordinated rate control
-# ────────────────────────────────────────────────
 async def crawl_range(query, pool, client, stop_event):
     cursor = None
     total = 0
@@ -131,7 +111,7 @@ async def crawl_range(query, pool, client, stop_event):
 
     while not stop_event.is_set():
         try:
-            # Each request must acquire the global pacing lock
+            
             async with RATE_LOCK:
                 await asyncio.sleep(RATE_DELAY + random.uniform(0.5, 1.5))
                 data = await client.fetch_repos(query, cursor)
@@ -183,9 +163,6 @@ async def crawl_worker(base_query, pool, client, stop_event, worker_id):
     logging.info(f"Worker-{worker_id} done ({total:,} repos total)")
 
 
-# ────────────────────────────────────────────────
-# Entrypoint
-# ────────────────────────────────────────────────
 async def main():
     logging.info(f"Starting async GitHub crawler (target={TOTAL_TARGET:,})")
 
@@ -198,7 +175,7 @@ async def main():
         stop_event = asyncio.Event()
 
         workers = []
-        for i, q in enumerate(BASE_QUERIES[:WORKERS]):  # Limit to 5
+        for i, q in enumerate(BASE_QUERIES[:WORKERS]): 
             await asyncio.sleep(i * 2)
             workers.append(asyncio.create_task(crawl_worker(q, pool, client, stop_event, i + 1)))
 
