@@ -4,12 +4,13 @@ import aiohttp
 from datetime import datetime, timezone
 
 # ────────────────────────────────────────────────
-# GitHub GraphQL Client (Improved rate-limit logic)
+# GitHub GraphQL Client (Enhanced 403 Handling)
 # ────────────────────────────────────────────────
 class GitHubGraphQLClient:
     """
     Optimized asynchronous client for GitHub GraphQL API.
-    Includes accurate rate-limit tracking and intelligent retry logic.
+    Includes robust handling for rate limits, abuse detection,
+    and automatic backoff logic to avoid 403 slowdowns.
     """
 
     API_URL = "https://api.github.com/graphql"
@@ -55,17 +56,25 @@ class GitHubGraphQLClient:
     """
 
     # ────────────────────────────────────────────────
-    # Fetch repositories (with smart retry logic)
+    # Fetch repositories (resilient retry + backoff)
     # ────────────────────────────────────────────────
     async def fetch_repos(self, query_string: str, cursor: str = None):
         """
-        Fetch one batch of repositories, handle transient and real rate-limit errors intelligently.
+        Fetch one batch of repositories.
+        Handles:
+          - Full rate-limit exhaustion
+          - Secondary rate-limit (abuse detection)
+          - Network and transient GraphQL errors
         """
-        for attempt in range(8):
+        for attempt in range(10):
             try:
                 async with self.session.post(
                     self.API_URL,
-                    headers={"Authorization": f"Bearer {self.token}"},
+                    headers={
+                        "Authorization": f"Bearer {self.token}",
+                        "Accept": "application/vnd.github+json",
+                        "X-Github-Api-Version": "2022-11-28",
+                    },
                     json={
                         "query": self.QUERY,
                         "variables": {"queryString": query_string, "cursor": cursor},
@@ -73,9 +82,18 @@ class GitHubGraphQLClient:
                 ) as resp:
 
                     # ────────────────────────────────────────────────
-                    # Handle non-200 status responses
+                    # Handle rate-limit and throttling responses
                     # ────────────────────────────────────────────────
                     if resp.status == 403:
+                        text = await resp.text()
+
+                        # 🧠 Detect "secondary rate limit" (abuse throttle)
+                        if "secondary rate limit" in text.lower() or "abuse" in text.lower():
+                            logging.warning("🚦 Secondary rate limit triggered — backing off 60s...")
+                            await asyncio.sleep(60)
+                            continue
+
+                        # Attempt to parse JSON to check true rate-limit exhaustion
                         try:
                             data = await resp.json()
                         except Exception:
@@ -85,17 +103,20 @@ class GitHubGraphQLClient:
                         remaining = rl.get("remaining")
                         reset_at = rl.get("resetAt")
 
-                        # ✅ True rate-limit exhaustion
                         if remaining == 0 and reset_at:
-                            reset_dt = datetime.strptime(reset_at, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+                            reset_dt = datetime.strptime(reset_at, "%Y-%m-%dT%H:%M:%SZ").replace(
+                                tzinfo=timezone.utc
+                            )
                             wait_sec = max((reset_dt - datetime.now(timezone.utc)).total_seconds(), 0)
-                            logging.warning(f"🕒 True rate limit reached — waiting {wait_sec/60:.1f} minutes until reset...")
+                            logging.warning(
+                                f"🕒 True rate limit reached — waiting {wait_sec/60:.1f} minutes until reset..."
+                            )
                             await asyncio.sleep(wait_sec + 5)
                             continue
 
-                        # ⚠️ Temporary abuse detection or secondary throttle
-                        logging.warning("⚠️ Temporary 403 throttle (not full rate limit) — retrying in 10s...")
-                        await asyncio.sleep(10)
+                        # Generic 403 with no details → short backoff
+                        logging.warning("⚠️ Generic 403 error — sleeping 20s and retrying...")
+                        await asyncio.sleep(20)
                         continue
 
                     elif resp.status >= 500:
@@ -106,13 +127,14 @@ class GitHubGraphQLClient:
                     elif resp.status != 200:
                         text = await resp.text()
                         logging.error(f"❌ Unexpected HTTP {resp.status}: {text}")
-                        await asyncio.sleep(3)
+                        await asyncio.sleep(5)
                         continue
 
                     # ────────────────────────────────────────────────
                     # Parse valid response
                     # ────────────────────────────────────────────────
                     data = await resp.json()
+
                     if "errors" in data:
                         logging.warning(f"⚠️ GraphQL errors: {data['errors']}")
                         await asyncio.sleep(5)
@@ -147,12 +169,12 @@ class GitHubGraphQLClient:
 
             except aiohttp.ClientError as e:
                 logging.error(f"💥 Network error: {e}")
-                await asyncio.sleep(3)
+                await asyncio.sleep(5)
                 continue
 
             except Exception as e:
                 logging.exception(f"⚠️ Unexpected error: {e}")
-                await asyncio.sleep(3)
+                await asyncio.sleep(5)
                 continue
 
         logging.error("❌ Failed after multiple retries for query: %s", query_string)
