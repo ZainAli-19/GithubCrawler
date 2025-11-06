@@ -1,14 +1,14 @@
 name: Crawl Stars
 
 on:
-  workflow_dispatch:     # ✅ Manual trigger
+  workflow_dispatch:        # ✅ Manual trigger
   schedule:
-    - cron: "0 0 * * *"  # ✅ Run daily at midnight UTC
+    - cron: "0 0 * * *"     # ✅ Run daily at midnight UTC
 
 jobs:
   crawl:
     runs-on: ubuntu-latest
-    timeout-minutes: 360   # Allow up to 6 hours
+    timeout-minutes: 360    # Allow up to 6 hours for large crawls
 
     services:
       postgres:
@@ -25,12 +25,17 @@ jobs:
           --health-timeout 5s
           --health-retries 10
 
+    env:
+      POSTGRES_HOST: 127.0.0.1
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+      GITHUB_TOKEN: ${{ github.token }}
+
     steps:
       # 1️⃣ Checkout repository
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          persist-credentials: true
 
       # 2️⃣ Set up Python
       - name: Set up Python
@@ -40,7 +45,8 @@ jobs:
 
       # 3️⃣ Install dependencies
       - name: Install dependencies
-        run: pip install -r src/requirements.txt
+        run: |
+          pip install -r src/requirements.txt
 
       # 4️⃣ Wait for PostgreSQL to be ready
       - name: Wait for PostgreSQL
@@ -58,14 +64,17 @@ jobs:
             fi
           done
 
-      # 5️⃣ Setup database schema
+      # 5️⃣ Apply all migrations (001, 002, ...)
       - name: Setup database schema
         env:
           PGPASSWORD: postgres
         run: |
-          echo "📦 Setting up database schema..."
-          psql -h 127.0.0.1 -U postgres -d postgres -f src/db/migrations/001_create_tables.sql
-          echo "✅ Schema setup complete."
+          echo "📦 Applying database migrations..."
+          for file in $(ls src/db/migrations/*.sql | sort); do
+            echo "▶️ Running migration: $file"
+            psql -h 127.0.0.1 -U postgres -d postgres -f "$file"
+          done
+          echo "✅ All migrations applied."
 
       # 6️⃣ Run Async Parallel Crawler
       - name: Run async parallel crawler
@@ -91,7 +100,15 @@ jobs:
           psql -h 127.0.0.1 -U postgres -d postgres -c "\copy (SELECT * FROM repositories ORDER BY stars DESC) TO 'data/repos.csv' CSV HEADER"
           echo "✅ Export complete."
 
-      # 8️⃣ Commit and Push Data Updates
+      # 8️⃣ Verify total repositories crawled
+      - name: Verify data count
+        env:
+          PGPASSWORD: postgres
+        run: |
+          echo "📊 Checking total repositories stored..."
+          psql -h 127.0.0.1 -U postgres -d postgres -c "SELECT COUNT(*) AS total_repos FROM repositories;"
+
+      # 9️⃣ Commit and Push Data Updates
       - name: Commit and push updated data
         run: |
           git config --global user.name "github-actions[bot]"
@@ -105,7 +122,7 @@ jobs:
             echo "✅ Data committed and pushed."
           fi
 
-      # 9️⃣ Upload Artifact for Manual Download
+      # 🔟 Upload Artifact for Manual Download
       - name: Upload artifact (repos.csv)
         uses: actions/upload-artifact@v4
         with:
