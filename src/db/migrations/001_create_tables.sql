@@ -9,7 +9,6 @@ CREATE TABLE IF NOT EXISTS repositories (
     owner TEXT
 );
 
--- ✅ Store progress state for resumable crawls
 CREATE TABLE IF NOT EXISTS crawl_checkpoint (
     id SERIAL PRIMARY KEY,
     cursor_value TEXT,
