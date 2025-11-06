@@ -2,9 +2,12 @@ import os
 import time
 import logging
 import psycopg2
-from psycopg2.extras import execute_values
+import hashlib
 from crawler.graphql_client import GitHubClient
 
+# ==========================
+# Configuration
+# ==========================
 CHECKPOINT_FILE = "data/checkpoint.txt"
 TOTAL_TARGET = 100_000  # Target number of repositories
 
@@ -13,7 +16,7 @@ TOTAL_TARGET = 100_000  # Target number of repositories
 # PostgreSQL Connection
 # ==========================
 def get_connection(retries=10, delay=5):
-    """Connect to PostgreSQL with auto-retry."""
+    """Establish and return a PostgreSQL connection with retries."""
     for attempt in range(1, retries + 1):
         try:
             conn = psycopg2.connect(
@@ -22,25 +25,55 @@ def get_connection(retries=10, delay=5):
                 user=os.getenv("POSTGRES_USER", "postgres"),
                 password=os.getenv("POSTGRES_PASSWORD", "postgres"),
             )
-            conn.autocommit = False
             logging.info("✅ Connected to PostgreSQL.")
             return conn
         except psycopg2.OperationalError as e:
-            logging.warning(f"⚠️ DB connection failed (attempt {attempt}/{retries}): {e}")
+            logging.warning(f"⚠️ Database not ready (attempt {attempt}/{retries}): {e}")
             time.sleep(delay)
     raise RuntimeError("❌ Could not connect to PostgreSQL after multiple attempts.")
 
 
 # ==========================
-# Checkpoint Handling (File)
+# Checkpoint Handling
 # ==========================
-def save_checkpoint_file(cursor_value, total_repos):
+def save_checkpoint(cursor_value, total_repos):
+    """Save progress to file and database (if available)."""
     os.makedirs("data", exist_ok=True)
     with open(CHECKPOINT_FILE, "w") as f:
         f.write(f"{cursor_value},{total_repos}")
 
+    try:
+        conn = get_connection()
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO crawl_checkpoint (id, cursor_value, total_repos, updated_at)
+                VALUES (1, %s, %s, NOW())
+                ON CONFLICT (id) DO UPDATE
+                SET cursor_value = EXCLUDED.cursor_value,
+                    total_repos = EXCLUDED.total_repos,
+                    updated_at = NOW();
+            """, (cursor_value, total_repos))
+            conn.commit()
+        conn.close()
+    except Exception as e:
+        logging.warning(f"⚠️ Could not save checkpoint to DB: {e}")
 
-def load_checkpoint_file():
+
+def load_checkpoint():
+    """Load progress from database first, fallback to file."""
+    try:
+        conn = get_connection()
+        with conn.cursor() as cur:
+            cur.execute("SELECT cursor_value, total_repos FROM crawl_checkpoint WHERE id = 1;")
+            row = cur.fetchone()
+        conn.close()
+        if row:
+            cursor, total = row
+            return cursor, total
+    except Exception:
+        pass
+
+    # fallback to local file
     if os.path.exists(CHECKPOINT_FILE):
         with open(CHECKPOINT_FILE, "r") as f:
             content = f.read().strip().split(",")
@@ -52,84 +85,39 @@ def load_checkpoint_file():
 
 
 # ==========================
-# Checkpoint Handling (DB)
-# ==========================
-def save_checkpoint_db(conn, cursor_value, total_repos):
-    """Save progress inside crawl_checkpoint table."""
-    try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                INSERT INTO crawl_checkpoint (cursor_value, total_repos, updated_at)
-                VALUES (%s, %s, NOW())
-                ON CONFLICT (id) DO UPDATE
-                SET cursor_value = EXCLUDED.cursor_value,
-                    total_repos = EXCLUDED.total_repos,
-                    updated_at = NOW();
-            """, (cursor_value, total_repos))
-        conn.commit()
-    except Exception as e:
-        conn.rollback()
-        logging.warning(f"⚠️ Could not save checkpoint to DB: {e}")
-
-
-def load_checkpoint_db(conn):
-    """Load checkpoint from DB, fallback to file if empty."""
-    try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT cursor_value, total_repos FROM crawl_checkpoint ORDER BY id DESC LIMIT 1;")
-            row = cur.fetchone()
-            if row:
-                return row[0], row[1]
-    except Exception as e:
-        logging.warning(f"⚠️ Could not load checkpoint from DB: {e}")
-    return load_checkpoint_file()
-
-
-# ==========================
 # Repository Insertion
 # ==========================
 def insert_repositories(conn, edges):
-    """Batch insert repos with ON CONFLICT handling and auto-reconnect."""
-    if not edges:
-        return
+    """Insert a batch of repositories into the database."""
+    with conn.cursor() as cur:
+        for edge in edges:
+            repo = edge["node"]
+            unique_id = hashlib.md5(repo["url"].encode("utf-8")).hexdigest()
 
-    repos_data = []
-    for edge in edges:
-        repo = edge["node"]
-        repos_data.append((
-            repo["url"],  # used for hash id
-            repo["name"],
-            f"{repo['owner']['login']}/{repo['name']}",
-            repo["stargazerCount"],
-            repo["primaryLanguage"]["name"] if repo["primaryLanguage"] else None,
-            repo["createdAt"],
-            repo["updatedAt"],
-            repo["owner"]["login"]
-        ))
+            try:
+                cur.execute(
+                    """
+                    INSERT INTO repositories (id, name, full_name, stars, language, created_at, updated_at, owner)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (id) DO UPDATE
+                    SET stars = EXCLUDED.stars,
+                        updated_at = EXCLUDED.updated_at;
+                    """,
+                    (
+                        unique_id,
+                        repo["name"],
+                        f"{repo['owner']['login']}/{repo['name']}",
+                        repo["stargazerCount"],
+                        repo["primaryLanguage"]["name"] if repo["primaryLanguage"] else None,
+                        repo["createdAt"],
+                        repo["updatedAt"],
+                        repo["owner"]["login"],
+                    ),
+                )
+            except Exception as e:
+                logging.error(f"❌ Insert failed for {repo['url']}: {e}")
 
-    query = """
-    INSERT INTO repositories (id, name, full_name, stars, language, created_at, updated_at, owner)
-    VALUES (md5(%s::text), %s, %s, %s, %s, %s, %s, %s)
-    ON CONFLICT (id) DO UPDATE
-    SET stars = EXCLUDED.stars,
-        updated_at = EXCLUDED.updated_at;
-    """
-
-    for attempt in range(3):
-        try:
-            with conn.cursor() as cur:
-                execute_values(cur, query, repos_data, page_size=100)
-            conn.commit()
-            logging.info(f"🧩 Inserted batch of {len(repos_data)} repositories.")
-            return
-        except psycopg2.OperationalError as e:
-            logging.warning(f"⚠️ Lost DB connection (attempt {attempt+1}/3): {e}")
-            conn = get_connection()
-        except Exception as e:
-            conn.rollback()
-            logging.error(f"❌ Insert failed: {e}")
-            time.sleep(2)
-    logging.critical("❌ All insert attempts failed.")
+    conn.commit()
 
 
 # ==========================
@@ -173,19 +161,19 @@ def crawl_repositories():
     }
     """
 
-    cursor_value, total_repos = load_checkpoint_db(conn)
-    logging.info(f"🚀 Starting/resuming crawl — {total_repos} repos already collected.")
+    cursor_value, total_repos = load_checkpoint()
+    logging.info(f"🚀 Resuming crawl — already have {total_repos} repos.")
 
     while total_repos < TOTAL_TARGET:
         data = client.run_query(query_template, {"cursor": cursor_value})
         if not data or "data" not in data:
-            logging.warning("⚠️ No data — retrying in 30s...")
+            logging.warning("⚠️ No data returned. Sleeping 30s before retry...")
             time.sleep(30)
             continue
 
         edges = data["data"]["search"]["edges"]
         if not edges:
-            logging.info("🎉 No more pages available.")
+            logging.info("🎉 No more pages — crawl complete.")
             break
 
         insert_repositories(conn, edges)
@@ -193,22 +181,22 @@ def crawl_repositories():
 
         page_info = data["data"]["search"]["pageInfo"]
         cursor_value = page_info["endCursor"]
+        save_checkpoint(cursor_value, total_repos)
 
-        # Save checkpoint in both file & DB
-        save_checkpoint_file(cursor_value, total_repos)
-        save_checkpoint_db(conn, cursor_value, total_repos)
-
-        logging.info(f"✅ Total repositories inserted: {total_repos}")
+        logging.info(f"✅ Inserted {total_repos} repositories so far...")
 
         if not page_info["hasNextPage"]:
             logging.info("🎉 Crawl completed successfully!")
             break
 
-        time.sleep(2)  # polite delay
+        time.sleep(2)  # small delay to respect GitHub API rate limits
 
     conn.close()
-    logging.info("🔚 Crawl finished — PostgreSQL connection closed.")
+    logging.info("🔚 Crawl finished — database connection closed.")
 
 
+# ==========================
+# Entry Point
+# ==========================
 if __name__ == "__main__":
     crawl_repositories()
