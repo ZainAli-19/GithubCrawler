@@ -50,7 +50,12 @@ async def run_query(session, token, search, cursor=None):
             headers={"Authorization": f"Bearer {token}"}
         )
         if r.status == 200:
-            return await r.json()
+            data = await r.json()
+            if "errors" in data:
+                logging.warning(f"GraphQL errors: {data['errors']}")
+                await asyncio.sleep(15)
+                continue  # retry outer loop
+            return data
         elif r.status == 403:
             logging.warning("⏳ Hit GitHub rate limit — sleeping 60s...")
             await asyncio.sleep(60)
@@ -95,6 +100,11 @@ async def crawl_slice(pool, token, search, worker_id):
         logging.info(f"🧵 Worker {worker_id} starting slice: {search}")
         while True:
             data = await run_query(session, token, search, cursor)
+            # --- Defensive error handling ---
+            if not data or "data" not in data or "search" not in data["data"]:
+                logging.warning(f"⚠️ Invalid or empty API response: {data}")
+                await asyncio.sleep(10)  # back off briefly before retrying
+                continue
             nodes = data["data"]["search"]["nodes"]
             if not nodes:
                 break
@@ -125,10 +135,10 @@ async def main():
         min_size=1, max_size=10,
     )
 
-    tasks = [
-        asyncio.create_task(crawl_slice(pool, token, search, i + 1))
-        for i, search in enumerate(STAR_QUERIES)
-    ]
+    tasks = []
+    for i, search in enumerate(STAR_QUERIES):
+        await asyncio.sleep(2)  # stagger worker startup
+        tasks.append(asyncio.create_task(crawl_slice(pool, token, search, i + 1)))
     await asyncio.gather(*tasks)
     await pool.close()
     logging.info("🎉 All workers completed successfully!")
