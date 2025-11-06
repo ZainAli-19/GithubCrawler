@@ -1,14 +1,14 @@
-name: Crawl Stars
+name: Crawl 100K GitHub Repositories
 
 on:
-  workflow_dispatch:        # ✅ Manual trigger
+  workflow_dispatch:          # ✅ Manual trigger
   schedule:
-    - cron: "0 0 * * *"     # ✅ Run daily at midnight UTC
+    - cron: "0 0 * * *"       # ✅ Daily at midnight UTC
 
 jobs:
   crawl:
     runs-on: ubuntu-latest
-    timeout-minutes: 360    # Allow up to 6 hours for large crawls
+    timeout-minutes: 360      # Allow up to 6 hours
 
     services:
       postgres:
@@ -45,37 +45,34 @@ jobs:
 
       # 3️⃣ Install dependencies
       - name: Install dependencies
-        run: |
-          pip install -r src/requirements.txt
+        run: pip install -r src/requirements.txt
 
-      # 4️⃣ Wait for PostgreSQL to be ready
+      # 4️⃣ Wait for PostgreSQL
       - name: Wait for PostgreSQL
         env:
           PGPASSWORD: postgres
         run: |
-          echo "⏳ Waiting for PostgreSQL to be ready..."
+          echo "⏳ Waiting for PostgreSQL..."
           for i in {1..20}; do
             if pg_isready -h 127.0.0.1 -p 5432 -U postgres; then
               echo "✅ PostgreSQL is ready!"
               break
-            else
-              echo "PostgreSQL not ready yet... waiting 3s"
-              sleep 3
             fi
+            echo "PostgreSQL not ready yet... retrying in 3s"
+            sleep 3
           done
 
-      # 5️⃣ Recreate database schema (single migration file)
+      # 5️⃣ Setup schema
       - name: Setup database schema
         env:
           PGPASSWORD: postgres
         run: |
-          echo "📦 Recreating database schema..."
-          psql -h 127.0.0.1 -U postgres -d postgres -c "DROP TABLE IF EXISTS repositories, crawl_logs CASCADE;"
+          echo "📦 Applying database migrations..."
           psql -h 127.0.0.1 -U postgres -d postgres -f src/db/migrations/001_create_tables.sql
-          echo "✅ Database schema ready."
+          echo "✅ Schema ready."
 
-      # 6️⃣ Run Async Parallel Crawler
-      - name: Run async parallel crawler
+      # 6️⃣ Run crawler until DB >= 100K repos
+      - name: Run async parallel crawler until 100K
         working-directory: src
         env:
           POSTGRES_HOST: 127.0.0.1
@@ -84,9 +81,22 @@ jobs:
           POSTGRES_DB: postgres
           GITHUB_TOKEN: ${{ github.token }}
         run: |
-          echo "🚀 Running parallel async crawler (5 workers)..."
-          python -m crawler.crawler_async
-          echo "✅ Parallel crawl completed successfully."
+          TARGET=100000
+          ATTEMPT=1
+          while true; do
+            echo "🚀 Run #$ATTEMPT — running crawler_async.py ..."
+            python -m crawler.crawler_async || true
+            COUNT=$(psql -h 127.0.0.1 -U postgres -d postgres -t -c "SELECT COUNT(*) FROM repositories;" | tr -d '[:space:]')
+            echo "📊 Current repositories in DB: $COUNT"
+            if [ "$COUNT" -ge "$TARGET" ]; then
+              echo "🎯 Target reached — $COUNT repositories collected."
+              break
+            fi
+            ATTEMPT=$((ATTEMPT + 1))
+            echo "⏳ Not yet 100K (current: $COUNT). Retrying after 2 minutes..."
+            sleep 120
+          done
+          echo "✅ Final count: $(psql -h 127.0.0.1 -U postgres -d postgres -t -c 'SELECT COUNT(*) FROM repositories;')"
 
       # 7️⃣ Export Database Snapshot to CSV
       - name: Export repositories to CSV
@@ -98,30 +108,21 @@ jobs:
           psql -h 127.0.0.1 -U postgres -d postgres -c "\copy (SELECT * FROM repositories ORDER BY stars DESC) TO 'data/repos.csv' CSV HEADER"
           echo "✅ Export complete."
 
-      # 8️⃣ Verify total repositories crawled
-      - name: Verify data count
-        env:
-          PGPASSWORD: postgres
-        run: |
-          echo "📊 Checking total repositories stored..."
-          psql -h 127.0.0.1 -U postgres -d postgres -c "SELECT COUNT(*) AS total_repos FROM repositories;"
-
-      # 9️⃣ Commit and Push Data Updates
+      # 8️⃣ Commit and Push CSV
       - name: Commit and push updated data
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          mkdir -p data
           git add data/repos.csv
           if git diff --cached --quiet; then
             echo "🟡 No new data to commit."
           else
-            git commit -m "📊 Auto-update: GitHub repos crawl on $(date -u +"%Y-%m-%d %H:%M:%S UTC")"
+            git commit -m "📊 Auto-update: 100K repo crawl on $(date -u +"%Y-%m-%d %H:%M:%S UTC")"
             git push
             echo "✅ Data committed and pushed."
           fi
 
-      # 🔟 Upload Artifact for Manual Download
+      # 9️⃣ Upload artifact (for manual download)
       - name: Upload artifact (repos.csv)
         uses: actions/upload-artifact@v4
         with:
