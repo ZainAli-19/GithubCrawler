@@ -28,9 +28,10 @@ GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 # Constants
 # ────────────────────────────────────────────────
 TOTAL_TARGET = 100_000
-WORKERS = 8
+WORKERS = 5                     # Safe concurrency level (no 403s)
 INSERT_BATCH_SIZE = 300
-RATE_DELAY = 2.0
+RATE_DELAY = 4.5                # Global pacing delay (seconds)
+MAX_BACKOFF = 10
 
 BASE_QUERIES = [
     "stars:>20000",
@@ -42,6 +43,11 @@ BASE_QUERIES = [
     "stars:100..199",
     "stars:1..99",
 ]
+
+# ────────────────────────────────────────────────
+# Global rate control semaphore
+# ────────────────────────────────────────────────
+RATE_LOCK = asyncio.Semaphore(1)
 
 # ────────────────────────────────────────────────
 # Utilities
@@ -106,7 +112,7 @@ async def insert_batch(pool, nodes):
                     values,
                 )
             except Exception as e:
-                logging.warning(f"⚠️ Bulk insert failed: {e}")
+                logging.warning(f"Bulk insert failed: {e}")
 
 
 async def get_repo_count(pool):
@@ -116,17 +122,22 @@ async def get_repo_count(pool):
 
 
 # ────────────────────────────────────────────────
-# Crawling logic with auto-resume
+# Crawling logic with coordinated rate control
 # ────────────────────────────────────────────────
 async def crawl_range(query, pool, client, stop_event):
     cursor = None
     total = 0
     buffer = []
+
     while not stop_event.is_set():
         try:
-            data = await client.fetch_repos(query, cursor)
+            # Each request must acquire the global pacing lock
+            async with RATE_LOCK:
+                await asyncio.sleep(RATE_DELAY + random.uniform(0.5, 1.5))
+                data = await client.fetch_repos(query, cursor)
+
             if not data:
-                logging.warning(f"⚠️ Empty response for {query}, waiting 10s...")
+                logging.warning(f"Empty response for {query}, waiting 10s...")
                 await asyncio.sleep(10)
                 continue
 
@@ -139,67 +150,62 @@ async def crawl_range(query, pool, client, stop_event):
                     await insert_batch(pool, buffer)
                     total += len(buffer)
                     buffer.clear()
-                    logging.info(f"📦 [{query}] Inserted {total:,} so far")
+                    logging.info(f"[{query}] Inserted {total:,} so far")
 
-            # move to next page or break
             if not page_info.get("hasNextPage"):
                 break
             cursor = page_info.get("endCursor")
 
-            await asyncio.sleep(RATE_DELAY + random.uniform(0.3, 0.8))
-
-
         except asyncio.CancelledError:
             break
         except Exception as e:
-            logging.warning(f"⚠️ Crawl error in {query}: {e}")
-            await asyncio.sleep(5)
+            logging.warning(f"Crawl error in {query}: {e}")
+            await asyncio.sleep(random.uniform(5, MAX_BACKOFF))
 
     if buffer:
         await insert_batch(pool, buffer)
         total += len(buffer)
+
     return total
 
 
 async def crawl_worker(base_query, pool, client, stop_event, worker_id):
-    logging.info(f"🧵 Worker-{worker_id} → {base_query}")
+    logging.info(f"Worker-{worker_id} started on {base_query}")
     total = 0
     while not stop_event.is_set():
         total += await crawl_range(base_query, pool, client, stop_event)
         count = await get_repo_count(pool)
-        logging.info(f"✅ Worker-{worker_id}: DB={count:,}, crawled={total:,}")
+        logging.info(f"Worker-{worker_id}: DB={count:,}, crawled={total:,}")
         if count >= TOTAL_TARGET:
             stop_event.set()
             break
-        logging.info(f"⏳ Worker-{worker_id} waiting 60s before resuming...")
-        await asyncio.sleep(60)  # retry same query (resume next hour if needed)
-    logging.info(f"🏁 Worker-{worker_id} done ({total:,} repos total)")
+        await asyncio.sleep(random.uniform(90, 180))
+    logging.info(f"Worker-{worker_id} done ({total:,} repos total)")
 
 
 # ────────────────────────────────────────────────
 # Entrypoint
 # ────────────────────────────────────────────────
 async def main():
-    logging.info(f"🚀 Starting async GitHub crawler (target={TOTAL_TARGET:,})")
+    logging.info(f"Starting async GitHub crawler (target={TOTAL_TARGET:,})")
 
     if not GITHUB_TOKEN:
-        raise ValueError("❌ Missing GITHUB_TOKEN environment variable")
+        raise ValueError("Missing GITHUB_TOKEN environment variable")
 
     pool = await init_db_pool()
     async with aiohttp.ClientSession() as session:
         client = GitHubGraphQLClient(GITHUB_TOKEN, session)
         stop_event = asyncio.Event()
+
         workers = []
-        for i, q in enumerate(BASE_QUERIES):
-            await asyncio.sleep(i * 1.5)  # stagger each worker by 1.5s
+        for i, q in enumerate(BASE_QUERIES[:WORKERS]):  # Limit to 5
+            await asyncio.sleep(i * 2)
             workers.append(asyncio.create_task(crawl_worker(q, pool, client, stop_event, i + 1)))
 
-
-        # monitor progress
         async def watcher():
             while not stop_event.is_set():
                 count = await get_repo_count(pool)
-                logging.info(f"📊 DB count: {count:,}")
+                logging.info(f"DB count: {count:,}")
                 if count >= TOTAL_TARGET:
                     stop_event.set()
                     break
@@ -209,7 +215,7 @@ async def main():
         await asyncio.gather(*workers)
 
     await pool.close()
-    logging.info("🎉 Crawl complete — database has ≥100,000 repositories.")
+    logging.info("Crawl complete — database has ≥100,000 repositories.")
 
 
 if __name__ == "__main__":
