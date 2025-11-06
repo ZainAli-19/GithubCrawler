@@ -67,8 +67,8 @@ jobs:
           psql -h 127.0.0.1 -U postgres -d postgres -f src/db/migrations/001_create_tables.sql
           echo "✅ Schema setup complete."
 
-      # 6️⃣ Run or Resume Crawl
-      - name: Run crawler (resumable)
+      # 6️⃣ Run Async Parallel Crawler
+      - name: Run async parallel crawler
         working-directory: src
         env:
           POSTGRES_HOST: 127.0.0.1
@@ -77,9 +77,9 @@ jobs:
           POSTGRES_DB: postgres
           GITHUB_TOKEN: ${{ github.token }}
         run: |
-          echo "🚀 Starting or resuming crawl from last checkpoint..."
-          python -m crawler.crawler
-          echo "✅ Crawl finished or checkpoint updated."
+          echo "🚀 Running parallel async crawler (5 workers)..."
+          python -m crawler.crawler_async
+          echo "✅ Parallel crawl completed successfully."
 
       # 7️⃣ Export Database Snapshot to CSV
       - name: Export repositories to CSV
