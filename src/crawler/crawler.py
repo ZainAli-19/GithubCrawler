@@ -3,7 +3,9 @@ import time
 import logging
 import psycopg2
 import hashlib
+from psycopg2.extras import execute_values
 from crawler.graphql_client import GitHubClient
+
 
 # ==========================
 # Configuration
@@ -88,36 +90,47 @@ def load_checkpoint():
 # Repository Insertion
 # ==========================
 def insert_repositories(conn, edges):
-    """Insert a batch of repositories into the database."""
-    with conn.cursor() as cur:
-        for edge in edges:
-            repo = edge["node"]
-            unique_id = hashlib.md5(repo["url"].encode("utf-8")).hexdigest()
+    """Batch insert repositories into PostgreSQL safely and efficiently."""
+    repos_data = []
 
-            try:
-                cur.execute(
-                    """
-                    INSERT INTO repositories (id, name, full_name, stars, language, created_at, updated_at, owner)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (id) DO UPDATE
-                    SET stars = EXCLUDED.stars,
-                        updated_at = EXCLUDED.updated_at;
-                    """,
-                    (
-                        unique_id,
-                        repo["name"],
-                        f"{repo['owner']['login']}/{repo['name']}",
-                        repo["stargazerCount"],
-                        repo["primaryLanguage"]["name"] if repo["primaryLanguage"] else None,
-                        repo["createdAt"],
-                        repo["updatedAt"],
-                        repo["owner"]["login"],
-                    ),
-                )
-            except Exception as e:
-                logging.error(f"❌ Insert failed for {repo['url']}: {e}")
+    for edge in edges:
+        repo = edge.get("node", {})
+        if not repo or "url" not in repo:
+            continue
 
-    conn.commit()
+        unique_id = hashlib.md5(repo["url"].encode("utf-8")).hexdigest()
+
+        repos_data.append((
+            unique_id,
+            repo.get("name"),
+            f"{repo['owner']['login']}/{repo['name']}" if repo.get("owner") else None,
+            repo.get("stargazerCount", 0),
+            repo["primaryLanguage"]["name"] if repo.get("primaryLanguage") else None,
+            repo.get("createdAt"),
+            repo.get("updatedAt"),
+            repo["owner"]["login"] if repo.get("owner") else None,
+        ))
+
+    if not repos_data:
+        logging.warning("⚠️ No repository data to insert.")
+        return
+
+    query = """
+    INSERT INTO repositories (id, name, full_name, stars, language, created_at, updated_at, owner)
+    VALUES %s
+    ON CONFLICT (id) DO UPDATE
+    SET stars = EXCLUDED.stars,
+        updated_at = EXCLUDED.updated_at;
+    """
+
+    try:
+        with conn.cursor() as cur:
+            execute_values(cur, query, repos_data, page_size=100)
+        conn.commit()
+        logging.info(f"✅ Inserted batch of {len(repos_data)} repositories.")
+    except Exception as e:
+        conn.rollback()
+        logging.error(f"❌ Bulk insert failed: {e}")
 
 
 # ==========================
@@ -189,7 +202,7 @@ def crawl_repositories():
             logging.info("🎉 Crawl completed successfully!")
             break
 
-        time.sleep(2)  # small delay to respect GitHub API rate limits
+        time.sleep(2)  # Respect GitHub API limits
 
     conn.close()
     logging.info("🔚 Crawl finished — database connection closed.")
