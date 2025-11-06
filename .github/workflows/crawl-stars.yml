@@ -80,6 +80,7 @@ jobs:
           POSTGRES_PASSWORD: postgres
           POSTGRES_DB: postgres
           GITHUB_TOKEN: ${{ github.token }}
+          PGPASSWORD: postgres
         run: |
           TARGET=100000
           ATTEMPT=1
