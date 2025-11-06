@@ -1,17 +1,20 @@
+-- src/db/migrations/001_create_tables.sql
 CREATE TABLE IF NOT EXISTS repositories (
-    id TEXT PRIMARY KEY,
-    name TEXT,
-    full_name TEXT,
-    stars INTEGER,
-    language TEXT,
-    created_at TIMESTAMP,
-    updated_at TIMESTAMP,
-    owner TEXT
+    id BIGINT PRIMARY KEY,
+    name TEXT NOT NULL,
+    owner TEXT NOT NULL,
+    stars INT,
+    forks INT,  -- ✅ Added this missing column
+    created_at TIMESTAMPTZ,
+    updated_at TIMESTAMPTZ,
+    pushed_at TIMESTAMPTZ,
+    url TEXT
 );
 
-CREATE TABLE IF NOT EXISTS crawl_checkpoint (
+CREATE TABLE IF NOT EXISTS crawl_logs (
     id SERIAL PRIMARY KEY,
-    cursor_value TEXT,
-    total_repos INTEGER DEFAULT 0,
-    updated_at TIMESTAMP DEFAULT NOW()
+    started_at TIMESTAMPTZ DEFAULT NOW(),
+    finished_at TIMESTAMPTZ,
+    total_repos INT,
+    notes TEXT
 );
