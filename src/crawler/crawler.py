@@ -6,17 +6,9 @@ import hashlib
 from psycopg2.extras import execute_values
 from crawler.graphql_client import GitHubClient
 
-
-# ==========================
-# Configuration
-# ==========================
 CHECKPOINT_FILE = "data/checkpoint.txt"
-TOTAL_TARGET = 100_000  # Target number of repositories
+TOTAL_TARGET = 100_000 
 
-
-# ==========================
-# PostgreSQL Connection
-# ==========================
 def get_connection(retries=10, delay=5):
     """Establish and return a PostgreSQL connection with retries."""
     for attempt in range(1, retries + 1):
@@ -27,17 +19,14 @@ def get_connection(retries=10, delay=5):
                 user=os.getenv("POSTGRES_USER", "postgres"),
                 password=os.getenv("POSTGRES_PASSWORD", "postgres"),
             )
-            logging.info("✅ Connected to PostgreSQL.")
+            logging.info("Connected to PostgreSQL.")
             return conn
         except psycopg2.OperationalError as e:
-            logging.warning(f"⚠️ Database not ready (attempt {attempt}/{retries}): {e}")
+            logging.warning(f"Database not ready (attempt {attempt}/{retries}): {e}")
             time.sleep(delay)
-    raise RuntimeError("❌ Could not connect to PostgreSQL after multiple attempts.")
+    raise RuntimeError("Could not connect to PostgreSQL after multiple attempts.")
 
 
-# ==========================
-# Checkpoint Handling
-# ==========================
 def save_checkpoint(cursor_value, total_repos):
     """Save progress to file and database (if available)."""
     os.makedirs("data", exist_ok=True)
@@ -58,7 +47,7 @@ def save_checkpoint(cursor_value, total_repos):
             conn.commit()
         conn.close()
     except Exception as e:
-        logging.warning(f"⚠️ Could not save checkpoint to DB: {e}")
+        logging.warning(f"Could not save checkpoint to DB: {e}")
 
 
 def load_checkpoint():
@@ -75,7 +64,6 @@ def load_checkpoint():
     except Exception:
         pass
 
-    # fallback to local file
     if os.path.exists(CHECKPOINT_FILE):
         with open(CHECKPOINT_FILE, "r") as f:
             content = f.read().strip().split(",")
@@ -85,10 +73,6 @@ def load_checkpoint():
                 return cursor, total
     return None, 0
 
-
-# ==========================
-# Repository Insertion
-# ==========================
 def insert_repositories(conn, edges):
     """Batch insert repositories into PostgreSQL safely and efficiently."""
     repos_data = []
@@ -112,7 +96,7 @@ def insert_repositories(conn, edges):
         ))
 
     if not repos_data:
-        logging.warning("⚠️ No repository data to insert.")
+        logging.warning("No repository data to insert.")
         return
 
     query = """
@@ -127,15 +111,11 @@ def insert_repositories(conn, edges):
         with conn.cursor() as cur:
             execute_values(cur, query, repos_data, page_size=100)
         conn.commit()
-        logging.info(f"✅ Inserted batch of {len(repos_data)} repositories.")
+        logging.info(f"Inserted batch of {len(repos_data)} repositories.")
     except Exception as e:
         conn.rollback()
-        logging.error(f"❌ Bulk insert failed: {e}")
+        logging.error(f"Bulk insert failed: {e}")
 
-
-# ==========================
-# Main Crawler Logic
-# ==========================
 def crawl_repositories():
     logging.basicConfig(
         format="%(asctime)s | %(levelname)s | %(message)s",
@@ -144,7 +124,7 @@ def crawl_repositories():
 
     token = os.getenv("GITHUB_TOKEN")
     if not token:
-        raise ValueError("❌ Missing GITHUB_TOKEN environment variable.")
+        raise ValueError("Missing GITHUB_TOKEN environment variable.")
 
     client = GitHubClient(token)
     conn = get_connection()
@@ -180,13 +160,13 @@ def crawl_repositories():
     while total_repos < TOTAL_TARGET:
         data = client.run_query(query_template, {"cursor": cursor_value})
         if not data or "data" not in data:
-            logging.warning("⚠️ No data returned. Sleeping 30s before retry...")
+            logging.warning("No data returned. Sleeping 30s before retry...")
             time.sleep(30)
             continue
 
         edges = data["data"]["search"]["edges"]
         if not edges:
-            logging.info("🎉 No more pages — crawl complete.")
+            logging.info("No more pages — crawl complete.")
             break
 
         insert_repositories(conn, edges)
@@ -196,20 +176,16 @@ def crawl_repositories():
         cursor_value = page_info["endCursor"]
         save_checkpoint(cursor_value, total_repos)
 
-        logging.info(f"✅ Inserted {total_repos} repositories so far...")
+        logging.info(f"Inserted {total_repos} repositories so far...")
 
         if not page_info["hasNextPage"]:
-            logging.info("🎉 Crawl completed successfully!")
+            logging.info("Crawl completed successfully!")
             break
 
-        time.sleep(2)  # Respect GitHub API limits
+        time.sleep(2)  
 
     conn.close()
-    logging.info("🔚 Crawl finished — database connection closed.")
+    logging.info("Crawl finished — database connection closed.")
 
-
-# ==========================
-# Entry Point
-# ==========================
 if __name__ == "__main__":
     crawl_repositories()
