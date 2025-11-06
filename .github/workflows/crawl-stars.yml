@@ -30,6 +30,7 @@ jobs:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: postgres
+      PGPASSWORD: postgres
       GITHUB_TOKEN: ${{ github.token }}
 
     steps:
@@ -49,8 +50,6 @@ jobs:
 
       # 4️⃣ Wait for PostgreSQL
       - name: Wait for PostgreSQL
-        env:
-          PGPASSWORD: postgres
         run: |
           echo "⏳ Waiting for PostgreSQL..."
           for i in {1..20}; do
@@ -64,45 +63,39 @@ jobs:
 
       # 5️⃣ Setup schema
       - name: Setup database schema
-        env:
-          PGPASSWORD: postgres
         run: |
           echo "📦 Applying database migrations..."
           psql -h 127.0.0.1 -U postgres -d postgres -f src/db/migrations/001_create_tables.sql
           echo "✅ Schema ready."
 
-      # 6️⃣ Run crawler until DB >= 100K repos
+      # 6️⃣ Run async parallel crawler until DB >= 100K repos
       - name: Run async parallel crawler until 100K
         working-directory: src
-        env:
-          POSTGRES_HOST: 127.0.0.1
-          POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: postgres
-          POSTGRES_DB: postgres
-          GITHUB_TOKEN: ${{ github.token }}
-          PGPASSWORD: postgres
         run: |
           TARGET=100000
           ATTEMPT=1
+          export PGPASSWORD=$POSTGRES_PASSWORD
           while true; do
             echo "🚀 Run #$ATTEMPT — running crawler_async.py ..."
             python -m crawler.crawler_async || true
+
             COUNT=$(psql -h 127.0.0.1 -U postgres -d postgres -t -c "SELECT COUNT(*) FROM repositories;" | tr -d '[:space:]')
             echo "📊 Current repositories in DB: $COUNT"
-            if [ "$COUNT" -ge "$TARGET" ]; then
+
+            if [ -n "$COUNT" ] && [ "$COUNT" -ge "$TARGET" ]; then
               echo "🎯 Target reached — $COUNT repositories collected."
               break
             fi
+
             ATTEMPT=$((ATTEMPT + 1))
             echo "⏳ Not yet 100K (current: $COUNT). Retrying after 2 minutes..."
             sleep 120
           done
+
           echo "✅ Final count: $(psql -h 127.0.0.1 -U postgres -d postgres -t -c 'SELECT COUNT(*) FROM repositories;')"
 
       # 7️⃣ Export Database Snapshot to CSV
       - name: Export repositories to CSV
-        env:
-          PGPASSWORD: postgres
         run: |
           mkdir -p data
           echo "📤 Exporting repositories table..."
