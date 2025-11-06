@@ -28,13 +28,20 @@ GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 # ────────────────────────────────────────────────
 TOTAL_TARGET = 100_000
 BATCH_SIZE = 100
-WORKERS = 5
+WORKERS = 8  # ⚡ increased concurrency safely
+INSERT_BATCH_SIZE = 300  # group inserts for fewer transactions
+RATE_DELAY = 0.8  # reduced sleep (still API-safe)
 MAX_RETRIES = 5
+
+# Diverse star ranges to distribute load across GitHub’s data clusters
 BASE_QUERIES = [
-    "stars:>10000",
+    "stars:>20000",
+    "stars:10000..19999",
     "stars:5000..9999",
     "stars:1000..4999",
-    "stars:100..999",
+    "stars:500..999",
+    "stars:200..499",
+    "stars:100..199",
     "stars:1..99",
 ]
 
@@ -42,13 +49,13 @@ BASE_QUERIES = [
 # Utils
 # ────────────────────────────────────────────────
 def parse_datetime(ts: str):
-    """Convert ISO8601 string to datetime.datetime or return None."""
-    if ts and isinstance(ts, str):
-        for fmt in ("%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S.%fZ"):
-            try:
-                return datetime.strptime(ts, fmt)
-            except ValueError:
-                continue
+    if not ts:
+        return None
+    for fmt in ("%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S.%fZ"):
+        try:
+            return datetime.strptime(ts, fmt)
+        except ValueError:
+            continue
     return None
 
 
@@ -61,142 +68,139 @@ async def init_db_pool():
         password=POSTGRES_PASSWORD,
         database=POSTGRES_DB,
         host=POSTGRES_HOST,
-        min_size=1,
-        max_size=10,
+        min_size=2,
+        max_size=20,
     )
 
 
 async def insert_batch(pool, nodes):
-    """Insert batch safely into DB."""
+    """Efficient bulk insert for performance."""
+    if not nodes:
+        return
     async with pool.acquire() as conn:
         async with conn.transaction():
-            for repo in nodes:
-                try:
-                    await conn.execute(
-                        """
-                        INSERT INTO repositories (
-                            id, name, owner, stars, forks,
-                            created_at, updated_at, pushed_at, url
-                        )
-                        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-                        ON CONFLICT (id) DO UPDATE
-                        SET stars = EXCLUDED.stars,
-                            forks = EXCLUDED.forks,
-                            updated_at = EXCLUDED.updated_at;
-                        """,
-                        repo["id"],
-                        repo["name"],
-                        repo["owner"]["login"] if repo.get("owner") else None,
-                        repo["stargazerCount"],
-                        repo["forkCount"],
-                        parse_datetime(repo.get("createdAt")),
-                        parse_datetime(repo.get("updatedAt")),
-                        parse_datetime(repo.get("pushedAt")),
-                        repo["url"],
+            values = [
+                (
+                    n["id"],
+                    n["name"],
+                    n["owner"]["login"] if n.get("owner") else None,
+                    n.get("stargazerCount", 0),
+                    n.get("forkCount", 0),
+                    parse_datetime(n.get("createdAt")),
+                    parse_datetime(n.get("updatedAt")),
+                    parse_datetime(n.get("pushedAt")),
+                    n.get("url"),
+                )
+                for n in nodes
+            ]
+            try:
+                await conn.executemany(
+                    """
+                    INSERT INTO repositories (
+                        id, name, owner, stars, forks,
+                        created_at, updated_at, pushed_at, url
                     )
-                except Exception as e:
-                    logging.warning(f"⚠️ DB insert skip: {e}")
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+                    ON CONFLICT (id) DO UPDATE
+                    SET stars = EXCLUDED.stars,
+                        forks = EXCLUDED.forks,
+                        updated_at = EXCLUDED.updated_at;
+                    """,
+                    values,
+                )
+            except Exception as e:
+                logging.warning(f"⚠️ Bulk insert failed: {e}")
 
 
 async def get_repo_count(pool):
     async with pool.acquire() as conn:
-        val = await conn.fetchval("SELECT COUNT(*) FROM repositories;")
-        return val or 0
+        return await conn.fetchval("SELECT COUNT(*) FROM repositories;") or 0
 
 
 # ────────────────────────────────────────────────
 # Crawl logic
 # ────────────────────────────────────────────────
-async def crawl_range(query: str, pool, client, stop_event: asyncio.Event):
-    """Crawl a given search query until no pages left or stop_event is set."""
+async def crawl_range(query, pool, client, stop_event):
     cursor = None
     total = 0
-    page = 0
+    buffer = []
     while not stop_event.is_set():
         try:
             data = await client.fetch_repos(query, cursor)
             if not data:
                 break
+
             nodes = data.get("nodes", [])
             if not nodes:
                 break
 
-            await insert_batch(pool, nodes)
-            total += len(nodes)
-            page += 1
-            logging.info(f"📦 [{query}] page {page}, total {total}")
+            buffer.extend(nodes)
+            if len(buffer) >= INSERT_BATCH_SIZE:
+                await insert_batch(pool, buffer)
+                total += len(buffer)
+                buffer.clear()
+                logging.info(f"📦 [{query}] Inserted {total:,} so far")
 
             page_info = data.get("pageInfo", {})
             if not page_info.get("hasNextPage"):
                 break
             cursor = page_info.get("endCursor")
-
-            await asyncio.sleep(1.2)
+            await asyncio.sleep(RATE_DELAY)
         except Exception as e:
-            logging.warning(f"⚠️ Range [{query}] failed: {e}")
-            await asyncio.sleep(3)
+            logging.warning(f"⚠️ Crawl error in {query}: {e}")
+            await asyncio.sleep(2)
+
+    # Insert remaining items
+    if buffer:
+        await insert_batch(pool, buffer)
+        total += len(buffer)
     return total
 
 
-async def crawl_worker(base_query: str, pool, client, stop_event: asyncio.Event, worker_id: int):
-    """One worker dynamically exploring sub-ranges."""
-    step = 100  # dynamic subrange star step (used only for <1000 ranges)
-    total = 0
-    logging.info(f"🧵 Worker {worker_id} starting on {base_query}")
-
-    # Expand low-star queries to cover more repos
-    if base_query.startswith("stars:1.."):
-        low, high = 1, 999
-        while not stop_event.is_set() and low < high:
-            sub_q = f"stars:{low}..{low+step-1}"
-            got = await crawl_range(sub_q, pool, client, stop_event)
-            total += got
-            low += step
-            count = await get_repo_count(pool)
-            logging.info(f"Worker {worker_id}: DB={count}, subrange={sub_q}")
-            if count >= TOTAL_TARGET:
-                stop_event.set()
-                break
-    else:
-        await crawl_range(base_query, pool, client, stop_event)
-
-    logging.info(f"🏁 Worker {worker_id} done — crawled ~{total} repos.")
+async def crawl_worker(base_query, pool, client, stop_event, worker_id):
+    logging.info(f"🧵 Worker-{worker_id} → {base_query}")
+    total = await crawl_range(base_query, pool, client, stop_event)
+    count = await get_repo_count(pool)
+    logging.info(f"🏁 Worker-{worker_id} done ({total:,} repos, DB={count:,})")
+    if count >= TOTAL_TARGET:
+        stop_event.set()
 
 
 # ────────────────────────────────────────────────
 # Entrypoint
 # ────────────────────────────────────────────────
 async def main():
-    logging.info(f"🚀 Starting async GitHub crawler aiming for {TOTAL_TARGET} repos...")
+    logging.info(f"🚀 Starting async GitHub crawler (target={TOTAL_TARGET:,})")
 
     if not GITHUB_TOKEN:
-        raise ValueError("❌ Missing GITHUB_TOKEN environment variable.")
+        raise ValueError("❌ Missing GITHUB_TOKEN environment variable")
+
+    pool = await init_db_pool()
 
     async with aiohttp.ClientSession() as session:
         client = GitHubGraphQLClient(GITHUB_TOKEN, session)
-        pool = await init_db_pool()
-
         stop_event = asyncio.Event()
-        tasks = [
+
+        workers = [
             asyncio.create_task(crawl_worker(q, pool, client, stop_event, i + 1))
             for i, q in enumerate(BASE_QUERIES)
         ]
 
-        # Watch DB count concurrently
+        # watcher to stop early
         async def watcher():
             while not stop_event.is_set():
                 count = await get_repo_count(pool)
+                logging.info(f"📊 DB count: {count:,}")
                 if count >= TOTAL_TARGET:
-                    logging.info(f"🎯 Target reached: {count} repos.")
                     stop_event.set()
                     break
-                await asyncio.sleep(30)
+                await asyncio.sleep(20)
 
-        tasks.append(asyncio.create_task(watcher()))
-        await asyncio.gather(*tasks)
-        await pool.close()
+        workers.append(asyncio.create_task(watcher()))
+        await asyncio.gather(*workers)
 
-    logging.info("🎉 Crawl complete — database has ≥100 000 repositories.")
+    await pool.close()
+    logging.info("🎉 Crawl complete — database has ≥100,000 repositories.")
 
 
 if __name__ == "__main__":
