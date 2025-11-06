@@ -1,150 +1,189 @@
-import os
 import asyncio
 import logging
-from datetime import datetime
-import aiohttp
+import os
+import sys
 import asyncpg
-from crawler.graphql_client import GitHubGraphQLClient
+from aiohttp import ClientSession, ClientError
+from datetime import datetime
 
-# ────────────────────────────────────────────────
-# Logging setup
-# ────────────────────────────────────────────────
+# --------------------------------------------------------------------
+# ✅ Setup logging
+# --------------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)]
 )
 
-# ────────────────────────────────────────────────
-# Environment variables
-# ────────────────────────────────────────────────
-POSTGRES_HOST = os.getenv("POSTGRES_HOST", "localhost")
+# --------------------------------------------------------------------
+# ✅ Environment variables
+# --------------------------------------------------------------------
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
+POSTGRES_HOST = os.getenv("POSTGRES_HOST", "127.0.0.1")
 POSTGRES_USER = os.getenv("POSTGRES_USER", "postgres")
 POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD", "postgres")
 POSTGRES_DB = os.getenv("POSTGRES_DB", "postgres")
-GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 
-# ────────────────────────────────────────────────
-# Constants
-# ────────────────────────────────────────────────
 MAX_RETRIES = 5
-BATCH_SIZE = 100
-WORKER_QUERIES = [
+CONCURRENT_WORKERS = 10  # Adjust based on rate limits
+GRAPHQL_URL = "https://api.github.com/graphql"
+
+# --------------------------------------------------------------------
+# ✅ Generate partitioned queries (stars + year)
+# --------------------------------------------------------------------
+STAR_BUCKETS = [
     "stars:>10000",
     "stars:5000..9999",
     "stars:1000..4999",
-    "stars:100..999",
-    "stars:1..99"
+    "stars:500..999",
+    "stars:200..499",
+    "stars:100..199",
+    "stars:50..99",
+    "stars:20..49",
+    "stars:10..19",
+    "stars:5..9",
+    "stars:2..4",
+    "stars:1"
 ]
 
-# ────────────────────────────────────────────────
-# Utility: parse ISO datetime safely
-# ────────────────────────────────────────────────
-def parse_datetime(ts: str):
-    """Convert ISO8601 string to datetime.datetime or return None."""
-    if ts and isinstance(ts, str):
-        for fmt in ("%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S.%fZ"):
-            try:
-                return datetime.strptime(ts, fmt)
-            except ValueError:
-                continue
-    return None
+YEARS = [f"created:{year}-01-01..{year}-12-31" for year in range(2010, 2025)]
+
+SEARCH_QUERIES = [
+    f"{stars} {year} sort:stars-desc"
+    for stars in STAR_BUCKETS
+    for year in YEARS
+]
 
 
-# ────────────────────────────────────────────────
-# Database helpers
-# ────────────────────────────────────────────────
-async def init_db_pool():
-    return await asyncpg.create_pool(
+# --------------------------------------------------------------------
+# ✅ GraphQL query
+# --------------------------------------------------------------------
+GRAPHQL_QUERY = """
+query ($queryString: String!, $cursor: String) {
+  search(query: $queryString, type: REPOSITORY, first: 100, after: $cursor) {
+    pageInfo {
+      endCursor
+      hasNextPage
+    }
+    nodes {
+      id
+      name
+      owner { login }
+      stargazerCount
+      forkCount
+      url
+      createdAt
+      updatedAt
+      primaryLanguage { name }
+    }
+  }
+}
+"""
+
+
+# --------------------------------------------------------------------
+# ✅ Fetch repositories for a single query slice
+# --------------------------------------------------------------------
+async def fetch_repositories(session, query_string, pool):
+    cursor = None
+    total_count = 0
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            while True:
+                payload = {"query": GRAPHQL_QUERY, "variables": {"queryString": query_string, "cursor": cursor}}
+                async with session.post(GRAPHQL_URL, json=payload) as resp:
+                    if resp.status != 200:
+                        text = await resp.text()
+                        raise Exception(f"HTTP {resp.status}: {text}")
+
+                    data = await resp.json()
+                    repos = data.get("data", {}).get("search", {}).get("nodes", [])
+                    page_info = data.get("data", {}).get("search", {}).get("pageInfo", {})
+
+                    if not repos:
+                        break
+
+                    async with pool.acquire() as conn:
+                        async with conn.transaction():
+                            await conn.executemany("""
+                                INSERT INTO repositories (
+                                    id, name, owner, stars, forks, url, created_at, updated_at, language
+                                )
+                                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                                ON CONFLICT (id) DO UPDATE
+                                SET stars = EXCLUDED.stars,
+                                    forks = EXCLUDED.forks,
+                                    updated_at = EXCLUDED.updated_at;
+                            """, [
+                                (
+                                    r["id"],
+                                    r["name"],
+                                    r["owner"]["login"],
+                                    r["stargazerCount"],
+                                    r["forkCount"],
+                                    r["url"],
+                                    r["createdAt"],
+                                    r["updatedAt"],
+                                    (r["primaryLanguage"]["name"] if r["primaryLanguage"] else None)
+                                )
+                                for r in repos
+                            ])
+
+                    total_count += len(repos)
+                    logging.info(f"✅ [{query_string}] inserted {len(repos)} (total: {total_count})")
+
+                    if not page_info.get("hasNextPage"):
+                        break
+                    cursor = page_info["endCursor"]
+
+            break  # success
+        except Exception as e:
+            logging.warning(f"⚠️ Query '{query_string}' attempt {attempt} failed: {e}")
+            await asyncio.sleep(2 ** attempt)
+    return total_count
+
+
+# --------------------------------------------------------------------
+# ✅ Worker pool runner
+# --------------------------------------------------------------------
+async def worker(name, queries, pool, session):
+    total = 0
+    for q in queries:
+        count = await fetch_repositories(session, q, pool)
+        total += count
+    logging.info(f"🏁 Worker {name} done. Total: {total} repos.")
+
+
+# --------------------------------------------------------------------
+# ✅ Main async entrypoint
+# --------------------------------------------------------------------
+async def main():
+    logging.info(f"🚀 Starting async GitHub crawler...")
+    logging.info(f"💡 Total query partitions: {len(SEARCH_QUERIES)}")
+
+    pool = await asyncpg.create_pool(
+        host=POSTGRES_HOST,
         user=POSTGRES_USER,
         password=POSTGRES_PASSWORD,
         database=POSTGRES_DB,
-        host=POSTGRES_HOST,
+        min_size=1,
+        max_size=CONCURRENT_WORKERS,
     )
 
+    headers = {"Authorization": f"Bearer {GITHUB_TOKEN}"}
 
-async def insert_batch(pool, nodes):
-    """Insert a batch of repository data into PostgreSQL."""
-    async with pool.acquire() as conn:
-        async with conn.transaction():
-            for repo in nodes:
-                # Convert timestamps
-                created_at = parse_datetime(repo.get("createdAt"))
-                updated_at = parse_datetime(repo.get("updatedAt"))
-                pushed_at = parse_datetime(repo.get("pushedAt"))
-
-                await conn.execute(
-                    """
-                    INSERT INTO repositories (id, name, owner, stars, forks, created_at, updated_at, pushed_at, url)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-                    ON CONFLICT (id) DO NOTHING;
-                    """,
-                    repo["id"],
-                    repo["name"],
-                    repo["owner"]["login"] if repo.get("owner") else None,
-                    repo["stargazerCount"],
-                    repo["forkCount"],
-                    created_at,
-                    updated_at,
-                    pushed_at,
-                    repo["url"],
-                )
-
-
-# ────────────────────────────────────────────────
-# Crawler logic
-# ────────────────────────────────────────────────
-async def crawl_slice(query: str, pool, client: GitHubGraphQLClient):
-    """Crawl one slice of the repo space."""
-    cursor = None
-    page = 0
-
-    for attempt in range(MAX_RETRIES):
-        try:
-            while True:
-                data = await client.fetch_repos(query, cursor)
-                if not data:
-                    break
-
-                nodes = data.get("nodes", [])
-                if not nodes:
-                    break
-
-                await insert_batch(pool, nodes)
-                page += 1
-
-                page_info = data.get("pageInfo", {})
-                if not page_info.get("hasNextPage"):
-                    break
-                cursor = page_info.get("endCursor")
-
-                logging.info(f"🧵 Worker {query} page {page} complete ({len(nodes)} repos)")
-
-            logging.info(f"✅ Worker {query} finished ({page} pages)")
-            break
-
-        except Exception as e:
-            logging.error(f"⚠️ Worker {query} failed attempt {attempt+1}: {e}")
-            await asyncio.sleep(2 ** attempt)
-    else:
-        logging.error(f"❌ Worker {query} exhausted retries.")
-
-
-# ────────────────────────────────────────────────
-# Main entrypoint
-# ────────────────────────────────────────────────
-async def main():
-    logging.info("🚀 Starting async GitHub crawler...")
-
-    async with aiohttp.ClientSession() as session:
-        client = GitHubGraphQLClient(GITHUB_TOKEN, session)
-        pool = await init_db_pool()
-
-        tasks = [crawl_slice(q, pool, client) for q in WORKER_QUERIES]
+    async with ClientSession(headers=headers) as session:
+        # Split queries among workers evenly
+        chunk_size = len(SEARCH_QUERIES) // CONCURRENT_WORKERS
+        tasks = [
+            asyncio.create_task(worker(i + 1, SEARCH_QUERIES[i * chunk_size:(i + 1) * chunk_size], pool, session))
+            for i in range(CONCURRENT_WORKERS)
+        ]
         await asyncio.gather(*tasks)
 
-        await pool.close()
-
-    logging.info("✅ Parallel crawl completed successfully.")
+    await pool.close()
+    logging.info("🎯 Crawling complete.")
 
 
 if __name__ == "__main__":
